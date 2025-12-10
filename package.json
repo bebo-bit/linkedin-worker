@@ -1,1 +1,16 @@
+{
+  "name": "linkedin-worker",
+  "version": "1.0.0",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "gologin": "^3.3.5",
+    "puppeteer-core": "^21.0.0"
+  }
+}
 
