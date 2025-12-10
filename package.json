@@ -2,15 +2,12 @@
   "name": "linkedin-worker",
   "version": "1.0.0",
   "main": "worker.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node worker.js"
   },
-  "engines": {
-    "node": ">=18"
-  },
   "dependencies": {
-    "gologin": "^3.3.5",
+    "gologin": "^2.1.33",
     "puppeteer-core": "^21.0.0"
   }
 }
-
