@@ -1,317 +1,592 @@
-const puppeteer = require('puppeteer-core');
+import { chromium } from 'playwright-core';
 
-// Environment variables
+// Configuration from environment - NO SUPABASE SERVICE KEY NEEDED
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const WORKER_SECRET = process.env.WORKER_SECRET;
 const GOLOGIN_API_TOKEN = process.env.GOLOGIN_API_TOKEN;
-const WORKER_ID = process.env.WORKER_ID || 'worker-001';
-const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || '30000');
+const AGENT_ID = process.env.AGENT_ID; // Required: 1:1 worker-agent mapping
+const WORKER_ID = process.env.WORKER_ID || `worker-${Date.now()}`;
+const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || '5000');
 
-// Validate required env vars
-if (!SUPABASE_URL || !WORKER_SECRET || !GOLOGIN_API_TOKEN) {
-  console.error('Missing required environment variables');
-  console.error('Required: SUPABASE_URL, WORKER_SECRET, GOLOGIN_API_TOKEN');
+// Validate required environment variables
+const missingVars = [];
+if (!SUPABASE_URL) missingVars.push('SUPABASE_URL');
+if (!WORKER_SECRET) missingVars.push('WORKER_SECRET');
+if (!GOLOGIN_API_TOKEN) missingVars.push('GOLOGIN_API_TOKEN');
+if (!AGENT_ID) missingVars.push('AGENT_ID');
+
+if (missingVars.length > 0) {
+  console.error('Missing required environment variables:', missingVars.join(', '));
+  console.error('Required: SUPABASE_URL, WORKER_SECRET, GOLOGIN_API_TOKEN, AGENT_ID');
   process.exit(1);
 }
 
-console.log(`[${WORKER_ID}] Starting worker...`);
-console.log(`[${WORKER_ID}] Supabase URL: ${SUPABASE_URL}`);
-console.log(`[${WORKER_ID}] Poll interval: ${POLL_INTERVAL}ms`);
+// Statistics
+let actionsProcessed = 0;
+let actionsFailed = 0;
 
-// Poll for actions via edge function
+// ============================================
+// Edge Function Helpers (replaces direct Supabase access)
+// ============================================
+
+async function callEdgeFunction(functionName, body) {
+  const response = await fetch(`${SUPABASE_URL}/functions/v1/${functionName}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-worker-secret': WORKER_SECRET
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Edge function ${functionName} failed: ${response.status} - ${errorText}`);
+  }
+
+  return response.json();
+}
+
+async function updateAgentState(loginState, extraData = {}) {
+  try {
+    await callEdgeFunction('worker-update-agent', {
+      workerId: WORKER_ID,
+      agentId: AGENT_ID,
+      loginState,
+      ...extraData
+    });
+  } catch (error) {
+    console.error('Failed to update agent state:', error.message);
+  }
+}
+
+async function sendHeartbeat(status = 'idle', currentActionId = null) {
+  try {
+    await callEdgeFunction('worker-heartbeat', {
+      workerId: WORKER_ID,
+      agentId: AGENT_ID,
+      status,
+      currentActionId,
+      actionsProcessed,
+      actionsFailed
+    });
+  } catch (error) {
+    console.error('Heartbeat error:', error.message);
+  }
+}
+
 async function pollForActions() {
   try {
-    const response = await fetch(`${SUPABASE_URL}/functions/v1/worker-poll`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-worker-secret': WORKER_SECRET,
-      },
-      body: JSON.stringify({
-        workerId: WORKER_ID,
-        limit: 1,
-      }),
+    const data = await callEdgeFunction('worker-poll', {
+      workerId: WORKER_ID,
+      agentId: AGENT_ID,
+      limit: 1
     });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`[${WORKER_ID}] Poll failed (${response.status}):`, errorText);
-      return [];
-    }
-
-    const data = await response.json();
-    console.log(`[${WORKER_ID}] Polled ${data.actions?.length || 0} actions`);
-    return data.actions || [];
+    
+    // Return first action or null
+    return data.actions?.[0] || null;
+    
   } catch (error) {
-    console.error(`[${WORKER_ID}] Poll error:`, error.message);
-    return [];
+    console.error('Poll error:', error.message);
+    return null;
   }
 }
 
-// Report action result via edge function
-async function reportResult(actionId, success, result = null, errorMessage = null, shouldRetry = false) {
+async function reportResult(actionId, status, result = null, errorMessage = null) {
   try {
-    const response = await fetch(`${SUPABASE_URL}/functions/v1/worker-report`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-worker-secret': WORKER_SECRET,
-      },
-      body: JSON.stringify({
-        workerId: WORKER_ID,
-        actionId,
-        success,
-        result,
-        errorMessage,
-        shouldRetry,
-      }),
+    await callEdgeFunction('worker-report', {
+      workerId: WORKER_ID,
+      actionId,
+      status,
+      result,
+      errorMessage
     });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`[${WORKER_ID}] Report failed (${response.status}):`, errorText);
-    } else {
-      console.log(`[${WORKER_ID}] Reported result for action ${actionId}: ${success ? 'SUCCESS' : 'FAILED'}`);
-    }
   } catch (error) {
-    console.error(`[${WORKER_ID}] Report error:`, error.message);
+    console.error('Failed to report result:', error.message);
   }
 }
 
-// Connect to GoLogin Cloud Browser
-async function connectToGoLoginProfile(profileId) {
-  const cloudBrowserUrl = `https://cloudbrowser.gologin.com/connect?token=${GOLOGIN_API_TOKEN}&profile=${profileId}`;
+// ============================================
+// Human-like behavior utilities
+// ============================================
+
+async function humanDelay(min = 500, max = 2000) {
+  const delay = Math.floor(Math.random() * (max - min + 1)) + min;
+  await new Promise(resolve => setTimeout(resolve, delay));
+}
+
+async function typeHuman(page, selector, text) {
+  const element = await page.locator(selector).first();
+  await element.click();
+  await humanDelay(200, 500);
   
-  console.log(`[${WORKER_ID}] Connecting to GoLogin Cloud Browser for profile: ${profileId}`);
+  for (const char of text) {
+    await element.pressSequentially(char, { delay: Math.random() * 150 + 50 });
+    if (Math.random() < 0.1) {
+      await humanDelay(300, 800);
+    }
+  }
+}
+
+async function clickHuman(page, selector) {
+  const element = await page.locator(selector).first();
+  const box = await element.boundingBox();
+  if (box) {
+    const x = box.x + box.width * (0.3 + Math.random() * 0.4);
+    const y = box.y + box.height * (0.3 + Math.random() * 0.4);
+    await page.mouse.move(x, y, { steps: Math.floor(Math.random() * 10) + 5 });
+    await humanDelay(100, 300);
+    await page.mouse.click(x, y);
+  } else {
+    await element.click();
+  }
+}
+
+async function scrollHuman(page, direction = 'down', amount = null) {
+  const scrollAmount = amount || Math.floor(Math.random() * 300) + 200;
+  const delta = direction === 'down' ? scrollAmount : -scrollAmount;
+  await page.mouse.wheel(0, delta);
+  await humanDelay(500, 1500);
+}
+
+// ============================================
+// GoLogin API integration
+// ============================================
+
+async function startGoLoginProfile(profileId) {
+  console.log(`Starting GoLogin profile: ${profileId}`);
   
-  const browser = await puppeteer.connect({
-    browserWSEndpoint: cloudBrowserUrl,
-    defaultViewport: null,
+  const response = await fetch(`https://api.gologin.com/browser/${profileId}/start?autostart=true`, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${GOLOGIN_API_TOKEN}`,
+      'Content-Type': 'application/json'
+    }
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Failed to start GoLogin profile: ${error}`);
+  }
+
+  const data = await response.json();
+  console.log('GoLogin profile started:', data);
+  return data;
+}
+
+async function stopGoLoginProfile(profileId) {
+  console.log(`Stopping GoLogin profile: ${profileId}`);
+  
+  try {
+    await fetch(`https://api.gologin.com/browser/${profileId}/stop`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${GOLOGIN_API_TOKEN}`
+      }
+    });
+  } catch (error) {
+    console.warn('Error stopping GoLogin profile:', error.message);
+  }
+}
+
+// ============================================
+// LinkedIn Login Handler
+// ============================================
+
+async function handleLinkedInLogin(page, context, action) {
+  console.log('Starting LinkedIn login flow...');
+  
+  // Update login state via Edge Function
+  await updateAgentState('navigating');
+  
+  // Navigate to LinkedIn login
+  await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded' });
+  await humanDelay(2000, 4000);
+  
+  // Check if already logged in
+  if (page.url().includes('/feed') || page.url().includes('/mynetwork')) {
+    console.log('Already logged in, extracting cookies...');
+    return await extractSessionAndComplete(context);
+  }
+  
+  // Update state to entering credentials
+  await updateAgentState('entering_credentials');
+  
+  // Get credentials from action payload (provided by worker-poll)
+  const email = action.payload?.email;
+  const password = action.payload?.password;
+  
+  if (!email || !password) {
+    throw new Error('LinkedIn credentials not provided in action payload');
+  }
+  
+  // Enter email
+  console.log('Entering email...');
+  await typeHuman(page, '#username', email);
+  await humanDelay(500, 1000);
+  
+  // Enter password
+  console.log('Entering password...');
+  await typeHuman(page, '#password', password);
+  await humanDelay(500, 1000);
+  
+  // Click sign in
+  console.log('Clicking sign in...');
+  await clickHuman(page, 'button[type="submit"]');
+  
+  // Wait for navigation
+  await page.waitForLoadState('domcontentloaded');
+  await humanDelay(3000, 5000);
+  
+  // Check for 2FA
+  const requires2FA = await check2FARequired(page);
+  
+  if (requires2FA) {
+    console.log('2FA required, waiting for user completion...');
+    await updateAgentState('awaiting_2fa', { twoFAMethod: requires2FA.method });
+    
+    // Wait for 2FA completion (up to 5 minutes)
+    const loginCompleted = await waitFor2FACompletion(page, 300000);
+    
+    if (!loginCompleted) {
+      throw new Error('2FA verification timed out');
+    }
+  }
+  
+  // Verify successful login
+  await updateAgentState('verifying_session');
+  
+  const isLoggedIn = await verifyLogin(page);
+  if (!isLoggedIn) {
+    throw new Error('Login verification failed - not on expected page');
+  }
+  
+  // Extract and save session
+  return await extractSessionAndComplete(context);
+}
+
+async function check2FARequired(page) {
+  const url = page.url();
+  
+  // Check URL patterns
+  if (url.includes('checkpoint') || url.includes('challenge') || url.includes('two-step')) {
+    console.log('2FA detected via URL pattern');
+  }
+  
+  // Check for various 2FA indicators
+  const indicators = [
+    { selector: 'input[name="pin"]', method: 'app' },
+    { selector: '#input__phone_verification_pin', method: 'sms' },
+    { selector: '#input__email_verification_pin', method: 'email' },
+    { selector: '[data-test="verification-code-input"]', method: 'app' },
+    { selector: 'input[placeholder*="code"]', method: 'app' },
+    { selector: 'input[placeholder*="verification"]', method: 'app' }
+  ];
+  
+  for (const indicator of indicators) {
+    const element = await page.locator(indicator.selector).first();
+    if (await element.isVisible({ timeout: 1000 }).catch(() => false)) {
+      return { required: true, method: indicator.method };
+    }
+  }
+  
+  // Check for text indicators
+  const pageText = await page.textContent('body');
+  if (pageText.includes('verification code') || 
+      pageText.includes('two-step verification') ||
+      pageText.includes('Enter the code')) {
+    return { required: true, method: 'unknown' };
+  }
+  
+  return null;
+}
+
+async function waitFor2FACompletion(page, timeout) {
+  const startTime = Date.now();
+  
+  while (Date.now() - startTime < timeout) {
+    const url = page.url();
+    
+    // Check if we've navigated away from 2FA
+    if (url.includes('/feed') || url.includes('/mynetwork') || url.includes('/in/')) {
+      return true;
+    }
+    
+    // Check if still on checkpoint
+    if (!url.includes('checkpoint') && !url.includes('challenge') && !url.includes('two-step')) {
+      // Might have completed, verify
+      const isLoggedIn = await verifyLogin(page);
+      if (isLoggedIn) return true;
+    }
+    
+    await humanDelay(2000, 3000);
+  }
+  
+  return false;
+}
+
+async function verifyLogin(page) {
+  const url = page.url();
+  
+  // Check URL patterns
+  if (url.includes('/feed') || url.includes('/mynetwork') || url.includes('/messaging')) {
+    return true;
+  }
+  
+  // Check for profile elements
+  const profileIndicators = [
+    '.global-nav__me',
+    '[data-control-name="identity_welcome_message"]',
+    '.feed-identity-module',
+    'img.global-nav__me-photo'
+  ];
+  
+  for (const selector of profileIndicators) {
+    const element = await page.locator(selector).first();
+    if (await element.isVisible({ timeout: 2000 }).catch(() => false)) {
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+async function extractSessionAndComplete(context) {
+  await updateAgentState('extracting_profile');
+  
+  // Get all cookies
+  const cookies = await context.cookies();
+  
+  // Find LinkedIn session cookies
+  const liAtCookie = cookies.find(c => c.name === 'li_at');
+  const liACookie = cookies.find(c => c.name === 'li_a');
+  
+  if (!liAtCookie) {
+    throw new Error('Failed to extract li_at session cookie');
+  }
+  
+  console.log('Session cookies extracted successfully');
+  
+  // Update agent via Edge Function with session cookies
+  await callEdgeFunction('worker-update-agent', {
+    workerId: WORKER_ID,
+    agentId: AGENT_ID,
+    loginState: 'completed',
+    status: 'connected',
+    loginError: null,
+    sessionCookies: {
+      li_at: liAtCookie.value,
+      li_a: liACookie?.value || null
+    }
   });
   
-  return browser;
+  console.log('Login completed successfully');
+  
+  return {
+    success: true,
+    message: 'LinkedIn login successful',
+    hasCookies: true
+  };
 }
 
-// Process a single action
+// ============================================
+// Action Processing
+// ============================================
+
 async function processAction(action) {
-  const { id, action_type, payload, gologin_profile, lead } = action;
+  console.log(`Processing action: ${action.action_type} (${action.id})`);
   
-  console.log(`[${WORKER_ID}] Processing action: ${action_type} (${id})`);
-  
-  if (!gologin_profile?.profile_id) {
-    console.error(`[${WORKER_ID}] No GoLogin profile linked`);
-    await reportResult(id, false, null, 'No GoLogin profile linked', false);
-    return;
+  // Get GoLogin profile ID from enriched action data
+  const gologinProfileId = action.gologin_profile?.profile_id;
+  if (!gologinProfileId) {
+    throw new Error('No GoLogin profile linked to this agent');
   }
-
+  
   let browser = null;
-
+  let context = null;
+  
   try {
-    // Connect to GoLogin Cloud Browser
-    browser = await connectToGoLoginProfile(gologin_profile.profile_id);
+    // Start GoLogin profile
+    const profileData = await startGoLoginProfile(gologinProfileId);
+    const wsEndpoint = profileData.wsEndpoint || profileData.ws?.puppeteer;
     
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 800 });
-
-    // Execute action based on type
-    let result = null;
-    
-    switch (action_type) {
-      case 'view_profile':
-        result = await viewProfile(page, lead);
-        break;
-      case 'connect':
-        result = await sendConnection(page, lead, payload);
-        break;
-      case 'message':
-        result = await sendMessage(page, lead, payload);
-        break;
-      case 'like':
-        result = await likePost(page, payload);
-        break;
-      case 'comment':
-        result = await commentOnPost(page, payload);
-        break;
-      default:
-        throw new Error(`Unknown action type: ${action_type}`);
+    if (!wsEndpoint) {
+      throw new Error('No WebSocket endpoint returned from GoLogin');
     }
-
-    await reportResult(id, true, result);
-    console.log(`[${WORKER_ID}] Action ${action_type} completed successfully`);
-
-  } catch (error) {
-    console.error(`[${WORKER_ID}] Action failed:`, error.message);
-    await reportResult(id, false, null, error.message, true);
+    
+    // Connect with Playwright
+    console.log('Connecting to browser via CDP...');
+    browser = await chromium.connectOverCDP(wsEndpoint);
+    context = browser.contexts()[0] || await browser.newContext();
+    const page = context.pages()[0] || await context.newPage();
+    
+    // Set viewport
+    await page.setViewportSize({ width: 1280, height: 800 });
+    
+    // Process based on action type
+    let result;
+    
+    switch (action.action_type) {
+      case 'linkedin_login':
+      case 'login': // Handle both for backwards compatibility
+        result = await handleLinkedInLogin(page, context, action);
+        break;
+      
+      case 'view_profile':
+        result = await handleViewProfile(page, action);
+        break;
+      
+      case 'send_connection':
+        result = await handleSendConnection(page, action);
+        break;
+      
+      case 'send_message':
+        result = await handleSendMessage(page, action);
+        break;
+      
+      default:
+        throw new Error(`Unknown action type: ${action.action_type}`);
+    }
+    
+    return result;
+    
   } finally {
+    // Cleanup
     if (browser) {
       try {
         await browser.close();
       } catch (e) {
-        console.error(`[${WORKER_ID}] Error closing browser:`, e.message);
+        console.warn('Error closing browser:', e.message);
       }
     }
+    
+    // Stop GoLogin profile
+    await stopGoLoginProfile(gologinProfileId);
   }
 }
 
-// LinkedIn action implementations
-async function viewProfile(page, lead) {
-  const profileUrl = lead?.linkedin_url || lead?.profile_url;
-  if (!profileUrl) throw new Error('No LinkedIn URL for lead');
+// Placeholder handlers for other actions
+async function handleViewProfile(page, action) {
+  const profileUrl = action.payload?.linkedin_url || action.lead?.linkedin_url;
+  if (!profileUrl) throw new Error('No profile URL provided');
   
-  await page.goto(profileUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+  await page.goto(profileUrl, { waitUntil: 'domcontentloaded' });
   await humanDelay(3000, 6000);
+  await scrollHuman(page, 'down');
   
-  // Scroll to simulate reading
-  await page.evaluate(() => window.scrollBy(0, 500));
-  await humanDelay(2000, 4000);
-  
-  return { viewed: true, url: profileUrl };
+  return { success: true, message: 'Profile viewed' };
 }
 
-async function sendConnection(page, lead, payload) {
-  const profileUrl = lead?.linkedin_url || lead?.profile_url;
-  if (!profileUrl) throw new Error('No LinkedIn URL for lead');
+async function handleSendConnection(page, action) {
+  const profileUrl = action.payload?.linkedin_url || action.lead?.linkedin_url;
+  if (!profileUrl) throw new Error('No profile URL provided');
   
-  await page.goto(profileUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+  await page.goto(profileUrl, { waitUntil: 'domcontentloaded' });
   await humanDelay(2000, 4000);
   
-  // Find and click Connect button
-  const connectBtn = await page.$('button[aria-label*="Connect"]');
-  if (!connectBtn) throw new Error('Connect button not found');
-  
-  await connectBtn.click();
-  await humanDelay(1000, 2000);
-  
-  // Add note if provided
-  if (payload?.message) {
-    const addNoteBtn = await page.$('button[aria-label*="Add a note"]');
-    if (addNoteBtn) {
-      await addNoteBtn.click();
-      await humanDelay(500, 1000);
-      
-      const noteTextarea = await page.$('textarea[name="message"]');
-      if (noteTextarea) {
-        await typeHuman(page, noteTextarea, payload.message);
+  // Find and click connect button
+  const connectBtn = page.locator('button:has-text("Connect")').first();
+  if (await connectBtn.isVisible()) {
+    await clickHuman(page, 'button:has-text("Connect")');
+    await humanDelay(1000, 2000);
+    
+    // Handle optional note
+    if (action.payload?.message) {
+      const addNoteBtn = page.locator('button:has-text("Add a note")');
+      if (await addNoteBtn.isVisible()) {
+        await addNoteBtn.click();
+        await humanDelay(500, 1000);
+        await typeHuman(page, 'textarea[name="message"]', action.payload.message);
       }
     }
-  }
-  
-  // Click Send
-  const sendBtn = await page.$('button[aria-label*="Send"]');
-  if (sendBtn) {
-    await sendBtn.click();
+    
+    // Send
+    await clickHuman(page, 'button:has-text("Send")');
     await humanDelay(1000, 2000);
+    
+    return { success: true, message: 'Connection request sent' };
   }
   
-  return { connected: true, url: profileUrl };
+  return { success: false, message: 'Connect button not found' };
 }
 
-async function sendMessage(page, lead, payload) {
-  const profileUrl = lead?.linkedin_url || lead?.profile_url;
-  if (!profileUrl) throw new Error('No LinkedIn URL for lead');
-  if (!payload?.message) throw new Error('No message content');
+async function handleSendMessage(page, action) {
+  const profileUrl = action.payload?.linkedin_url || action.lead?.linkedin_url;
+  const message = action.payload?.message;
   
-  await page.goto(profileUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+  if (!profileUrl || !message) {
+    throw new Error('Profile URL and message required');
+  }
+  
+  await page.goto(profileUrl, { waitUntil: 'domcontentloaded' });
   await humanDelay(2000, 4000);
   
-  // Click Message button
-  const messageBtn = await page.$('button[aria-label*="Message"]');
-  if (!messageBtn) throw new Error('Message button not found');
-  
-  await messageBtn.click();
-  await humanDelay(1500, 3000);
-  
-  // Type message
-  const messageBox = await page.$('div[role="textbox"]');
-  if (!messageBox) throw new Error('Message input not found');
-  
-  await typeHuman(page, messageBox, payload.message);
-  await humanDelay(500, 1000);
-  
-  // Send message
-  const sendBtn = await page.$('button[type="submit"]');
-  if (sendBtn) {
-    await sendBtn.click();
+  // Click message button
+  const messageBtn = page.locator('button:has-text("Message")').first();
+  if (await messageBtn.isVisible()) {
+    await clickHuman(page, 'button:has-text("Message")');
+    await humanDelay(1500, 3000);
+    
+    // Type message
+    await typeHuman(page, '.msg-form__contenteditable', message);
+    await humanDelay(500, 1000);
+    
+    // Send
+    await clickHuman(page, 'button:has-text("Send")');
     await humanDelay(1000, 2000);
+    
+    return { success: true, message: 'Message sent' };
   }
   
-  return { sent: true, url: profileUrl };
+  return { success: false, message: 'Message button not found' };
 }
 
-async function likePost(page, payload) {
-  if (!payload?.post_url) throw new Error('No post URL');
-  
-  await page.goto(payload.post_url, { waitUntil: 'networkidle2', timeout: 60000 });
-  await humanDelay(2000, 4000);
-  
-  const likeBtn = await page.$('button[aria-label*="Like"]');
-  if (!likeBtn) throw new Error('Like button not found');
-  
-  await likeBtn.click();
-  await humanDelay(1000, 2000);
-  
-  return { liked: true, url: payload.post_url };
-}
-
-async function commentOnPost(page, payload) {
-  if (!payload?.post_url) throw new Error('No post URL');
-  if (!payload?.comment) throw new Error('No comment content');
-  
-  await page.goto(payload.post_url, { waitUntil: 'networkidle2', timeout: 60000 });
-  await humanDelay(2000, 4000);
-  
-  // Click comment button to open comment box
-  const commentBtn = await page.$('button[aria-label*="Comment"]');
-  if (commentBtn) {
-    await commentBtn.click();
-    await humanDelay(1000, 2000);
-  }
-  
-  // Type comment
-  const commentBox = await page.$('div[role="textbox"]');
-  if (!commentBox) throw new Error('Comment input not found');
-  
-  await typeHuman(page, commentBox, payload.comment);
-  await humanDelay(500, 1000);
-  
-  // Submit comment
-  const postBtn = await page.$('button[aria-label*="Post"]');
-  if (postBtn) {
-    await postBtn.click();
-    await humanDelay(1000, 2000);
-  }
-  
-  return { commented: true, url: payload.post_url };
-}
-
-// Human-like delays
-function humanDelay(min, max) {
-  const delay = Math.floor(Math.random() * (max - min + 1)) + min;
-  return new Promise(resolve => setTimeout(resolve, delay));
-}
-
-// Human-like typing
-async function typeHuman(page, element, text) {
-  await element.click();
-  for (const char of text) {
-    await page.keyboard.type(char);
-    await humanDelay(50, 150);
-  }
-}
-
+// ============================================
 // Main loop
+// ============================================
+
+let isRunning = true;
+
 async function main() {
-  console.log(`[${WORKER_ID}] Worker started, polling every ${POLL_INTERVAL}ms`);
+  console.log('========================================');
+  console.log('LinkedIn Automation Worker Starting');
+  console.log(`Worker ID: ${WORKER_ID}`);
+  console.log(`Agent ID: ${AGENT_ID}`);
+  console.log(`Poll Interval: ${POLL_INTERVAL}ms`);
+  console.log('Architecture: Secure (Edge Functions only)');
+  console.log('========================================');
   
-  while (true) {
+  while (isRunning) {
     try {
-      const actions = await pollForActions();
+      await sendHeartbeat('polling');
       
-      for (const action of actions) {
-        await processAction(action);
+      const action = await pollForActions();
+      
+      if (action) {
+        console.log(`\n>>> Received action: ${action.action_type}`);
+        await sendHeartbeat('processing', action.id);
+        
+        try {
+          const result = await processAction(action);
+          await reportResult(action.id, 'completed', result);
+          actionsProcessed++;
+          console.log(`<<< Action completed: ${action.id}`);
+        } catch (error) {
+          console.error(`<<< Action failed: ${error.message}`);
+          await reportResult(action.id, 'failed', null, error.message);
+          actionsFailed++;
+          
+          // Update agent login state if it was a login action
+          if (action.action_type === 'linkedin_login' || action.action_type === 'login') {
+            await updateAgentState('failed', { loginError: error.message });
+          }
+        }
       }
+      
+      await sendHeartbeat('idle');
+      
     } catch (error) {
-      console.error(`[${WORKER_ID}] Main loop error:`, error.message);
+      console.error('Main loop error:', error.message);
     }
     
     await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
@@ -320,13 +595,14 @@ async function main() {
 
 // Graceful shutdown
 process.on('SIGINT', () => {
-  console.log(`[${WORKER_ID}] Shutting down...`);
-  process.exit(0);
+  console.log('\nShutting down gracefully...');
+  isRunning = false;
 });
 
 process.on('SIGTERM', () => {
-  console.log(`[${WORKER_ID}] Shutting down...`);
-  process.exit(0);
+  console.log('\nReceived SIGTERM, shutting down...');
+  isRunning = false;
 });
 
+// Start
 main().catch(console.error);
