@@ -1,11 +1,17 @@
 {
-  "name": "linkedin-worker",
+  "name": "linkedin-automation-worker",
   "version": "1.0.0",
+  "description": "LinkedIn automation worker using Playwright and GoLogin",
   "main": "worker.js",
+  "type": "module",
   "scripts": {
     "start": "node worker.js"
   },
   "dependencies": {
-    "puppeteer-core": "^22.0.0"
+    "@supabase/supabase-js": "^2.39.0",
+    "playwright-core": "^1.40.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
