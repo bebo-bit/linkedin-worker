@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.39.0",
+    "gologin": "^2.1.14",
     "playwright-core": "^1.40.0"
   },
   "engines": {
