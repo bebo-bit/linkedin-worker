@@ -155,22 +155,57 @@ async function scrollHuman(page, direction = 'down', amount = null) {
 // GoLogin SDK integration
 // ============================================
 
-async function startGoLoginProfile(profileId) {
+async function startGoLoginProfile(profileId, maxRetries = 3) {
   console.log(`Starting GoLogin profile via SDK: ${profileId}`);
   
-  // Create GoLogin instance with the SDK
-  const GL = new GoLogin({
-    token: GOLOGIN_API_TOKEN,
-    profile_id: profileId,
-    // Run headless on Railway (no display available)
-    extra_params: ['--headless=new'],
-  });
+  let lastError;
   
-  // Start the profile - returns a WebSocket URL compatible with Playwright
-  const wsUrl = await GL.start();
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // Create GoLogin instance with the SDK
+      const GL = new GoLogin({
+        token: GOLOGIN_API_TOKEN,
+        profile_id: profileId,
+        // Run headless on Railway (no display available)
+        extra_params: ['--headless=new'],
+      });
+      
+      // Start the profile - returns a WebSocket URL compatible with Playwright
+      const wsUrl = await GL.start();
+      
+      console.log(`GoLogin profile started (attempt ${attempt}), WebSocket URL obtained`);
+      return { wsUrl, GL };
+      
+    } catch (error) {
+      lastError = error;
+      const errorMsg = error.message || String(error);
+      
+      // Check if error is retryable (transient failures)
+      const isRetryable = 
+        errorMsg.includes('500') ||
+        errorMsg.includes('502') ||
+        errorMsg.includes('503') ||
+        errorMsg.includes('504') ||
+        errorMsg.includes('ECONNRESET') ||
+        errorMsg.includes('ECONNREFUSED') ||
+        errorMsg.includes('timeout') ||
+        errorMsg.includes('ETIMEDOUT') ||
+        errorMsg.includes('network') ||
+        errorMsg.includes('socket hang up');
+      
+      if (isRetryable && attempt < maxRetries) {
+        const delay = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s exponential backoff
+        console.warn(`GoLogin start failed (attempt ${attempt}/${maxRetries}): ${errorMsg}`);
+        console.log(`Retrying in ${delay/1000}s...`);
+        await new Promise(r => setTimeout(r, delay));
+      } else {
+        console.error(`GoLogin start failed permanently: ${errorMsg}`);
+        throw error;
+      }
+    }
+  }
   
-  console.log('GoLogin profile started via SDK, WebSocket URL obtained');
-  return { wsUrl, GL };
+  throw lastError;
 }
 
 async function stopGoLoginProfile(GL) {
@@ -189,8 +224,140 @@ async function stopGoLoginProfile(GL) {
 // LinkedIn Login Handler
 // ============================================
 
+// Check for app approval requirement (different from SMS/Email 2FA)
+async function checkAppApprovalRequired(page) {
+  const pageText = await page.textContent('body').catch(() => '');
+  const appApprovalIndicators = [
+    'Approve this sign-in from your LinkedIn app',
+    'Open the LinkedIn app to confirm',
+    'Confirm it\'s you',
+    'We sent a notification to your LinkedIn app',
+    'Approve from the LinkedIn app'
+  ];
+  
+  for (const indicator of appApprovalIndicators) {
+    if (pageText.toLowerCase().includes(indicator.toLowerCase())) {
+      console.log('App approval detected via text:', indicator);
+      return true;
+    }
+  }
+  
+  // Also check for: on checkpoint page but no OTP input = likely app approval
+  const url = page.url();
+  if (url.includes('checkpoint')) {
+    const hasOTPInput = await page.locator('input[name="pin"]').isVisible({ timeout: 1000 }).catch(() => false);
+    const hasCodeInput = await page.locator('input[placeholder*="code"]').isVisible({ timeout: 500 }).catch(() => false);
+    if (!hasOTPInput && !hasCodeInput) {
+      console.log('On checkpoint page but no OTP input - likely app approval');
+      return true;
+    }
+  }
+  
+  return false;
+}
+
+// Check for login failure (bad password, account locked)
+async function checkLoginFailed(page) {
+  const pageText = await page.textContent('body').catch(() => '');
+  const url = page.url();
+  
+  const errorIndicators = [
+    { text: "that's not the right password", type: 'invalid_credentials' },
+    { text: "wrong password", type: 'invalid_credentials' },
+    { text: "incorrect password", type: 'invalid_credentials' },
+    { text: "please check your password", type: 'invalid_credentials' },
+    { text: "couldn't find a linkedin account", type: 'invalid_credentials' },
+    { text: "account has been restricted", type: 'account_locked' },
+    { text: "temporarily locked", type: 'account_locked' },
+    { text: "unusual activity", type: 'account_locked' },
+    { text: "your account has been temporarily restricted", type: 'account_locked' },
+    { text: "we've restricted your account", type: 'account_locked' },
+  ];
+  
+  const lowerText = pageText.toLowerCase();
+  
+  for (const indicator of errorIndicators) {
+    if (lowerText.includes(indicator.text)) {
+      console.log(`Login error detected: ${indicator.type} - "${indicator.text}"`);
+      return { failed: true, type: indicator.type };
+    }
+  }
+  
+  // Check: still on login page after submission = possible error
+  if (url.includes('/login') || url.includes('/uas/login')) {
+    // Check for visible error banner
+    const errorBanner = await page.locator('.form__label--error, [data-test="form-error"], .alert-error').isVisible({ timeout: 1000 }).catch(() => false);
+    if (errorBanner) {
+      console.log('Error banner detected on login page');
+      return { failed: true, type: 'invalid_credentials' };
+    }
+  }
+  
+  return null;
+}
+
+// Validate full session cookies for confidence
+async function validateFullSession(context) {
+  const cookies = await context.cookies();
+  
+  const liAtCookie = cookies.find(c => c.name === 'li_at');
+  const jsessionId = cookies.find(c => c.name === 'JSESSIONID');
+  const bcookie = cookies.find(c => c.name === 'bcookie');
+  const liACookie = cookies.find(c => c.name === 'li_a');
+  
+  // li_at is the crown jewel - must have this
+  if (!liAtCookie || !liAtCookie.value) {
+    return { valid: false, reason: 'Missing li_at cookie' };
+  }
+  
+  // Calculate confidence based on additional cookies
+  const confidenceSignals = {
+    hasLiAt: !!liAtCookie?.value,
+    hasLiA: !!liACookie?.value,
+    hasJSessionId: !!jsessionId?.value,
+    hasBcookie: !!bcookie?.value,
+  };
+  
+  const confidence = Object.values(confidenceSignals).filter(Boolean).length / 4;
+  
+  console.log(`Session validation: li_at=${!!liAtCookie?.value}, confidence=${(confidence * 100).toFixed(0)}%`);
+  
+  return { 
+    valid: true, 
+    cookies: { 
+      li_at: liAtCookie.value,
+      li_a: liACookie?.value || null
+    },
+    confidence
+  };
+}
+
 async function handleLinkedInLogin(page, context, action, agentId) {
   console.log(`Starting LinkedIn login flow for agent ${agentId}...`);
+  
+  // CRITICAL: Check if we have valid existing cookies - NEVER re-enter credentials if so
+  const existingCookies = action.payload?.existingCookies;
+  if (existingCookies?.li_at) {
+    console.log('Existing session cookies found - attempting cookie-based login...');
+    
+    // Set cookies first before navigating
+    await context.addCookies([
+      { name: 'li_at', value: existingCookies.li_at, domain: '.linkedin.com', path: '/' },
+      ...(existingCookies.li_a ? [{ name: 'li_a', value: existingCookies.li_a, domain: '.linkedin.com', path: '/' }] : [])
+    ]);
+    
+    // Navigate to feed to verify session
+    await page.goto('https://www.linkedin.com/feed', { waitUntil: 'domcontentloaded' });
+    await humanDelay(2000, 4000);
+    
+    const isValid = await verifyLogin(page);
+    if (isValid) {
+      console.log('Existing cookies valid - session restored without re-login');
+      return await extractSessionAndComplete(context, agentId);
+    }
+    
+    console.log('Existing cookies invalid - falling back to full login');
+  }
   
   // Update login state via Edge Function
   await updateAgentState(agentId, 'navigating');
@@ -199,7 +366,7 @@ async function handleLinkedInLogin(page, context, action, agentId) {
   await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded' });
   await humanDelay(2000, 4000);
   
-  // Check if already logged in
+  // Check if already logged in (maybe cookies worked after navigation)
   if (page.url().includes('/feed') || page.url().includes('/mynetwork')) {
     console.log('Already logged in, extracting cookies...');
     return await extractSessionAndComplete(context, agentId);
@@ -234,9 +401,36 @@ async function handleLinkedInLogin(page, context, action, agentId) {
   await page.waitForLoadState('domcontentloaded');
   await humanDelay(3000, 5000);
   
-  // Check for 2FA
-  const requires2FA = await check2FARequired(page);
+  // 1. Check for failed login FIRST (don't retry!)
+  const loginError = await checkLoginFailed(page);
+  if (loginError) {
+    const errorMessage = loginError.type === 'invalid_credentials' 
+      ? 'Wrong password - do NOT retry'
+      : 'Account locked by LinkedIn';
+    
+    await updateAgentState(agentId, loginError.type, {
+      status: 'needs_reauth',
+      loginError: errorMessage
+    });
+    
+    throw new Error(`Login failed: ${errorMessage}`);
+  }
   
+  // 2. Check for app approval (different from SMS/Email 2FA)
+  const needsAppApproval = await checkAppApprovalRequired(page);
+  if (needsAppApproval) {
+    console.log('LinkedIn app approval required...');
+    await updateAgentState(agentId, 'awaiting_app_approval', { twoFAMethod: 'linkedin_app' });
+    
+    // Wait for completion (up to 5 minutes)
+    const completed = await waitFor2FACompletion(page, 300000);
+    if (!completed) {
+      throw new Error('LinkedIn app approval timed out');
+    }
+  }
+  
+  // 3. Check for SMS/Email 2FA
+  const requires2FA = await check2FARequired(page);
   if (requires2FA) {
     console.log('2FA required, waiting for user completion...');
     await updateAgentState(agentId, 'awaiting_2fa', { twoFAMethod: requires2FA.method });
@@ -254,6 +448,16 @@ async function handleLinkedInLogin(page, context, action, agentId) {
   
   const isLoggedIn = await verifyLogin(page);
   if (!isLoggedIn) {
+    // Final check for any error state we missed
+    const finalError = await checkLoginFailed(page);
+    if (finalError) {
+      await updateAgentState(agentId, finalError.type, {
+        status: 'needs_reauth',
+        loginError: `Login verification failed: ${finalError.type}`
+      });
+      throw new Error(`Login failed after verification: ${finalError.type}`);
+    }
+    
     throw new Error('Login verification failed - not on expected page');
   }
   
