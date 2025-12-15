@@ -1,4 +1,5 @@
 import { chromium } from 'playwright-core';
+import GoLogin from 'gologin';
 
 // Configuration from environment - Multi-agent worker (no AGENT_ID required)
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -151,26 +152,38 @@ async function scrollHuman(page, direction = 'down', amount = null) {
 }
 
 // ============================================
-// GoLogin API integration
+// GoLogin SDK integration
 // ============================================
 
 async function startGoLoginProfile(profileId) {
-  console.log(`Connecting to GoLogin Cloud Browser for profile: ${profileId}`);
+  console.log(`Starting GoLogin profile via SDK: ${profileId}`);
   
-  // GoLogin Cloud Browser direct WebSocket connection
-  // This works with free trial and doesn't require the /browser/start API
-  const wsEndpoint = `wss://cloudbrowser.gologin.com/connect?token=${GOLOGIN_API_TOKEN}&profile=${profileId}`;
+  // Create GoLogin instance with the SDK
+  const GL = new GoLogin({
+    token: GOLOGIN_API_TOKEN,
+    profile_id: profileId,
+    // Run headless on Railway (no display available)
+    extra_params: ['--headless=new'],
+  });
   
-  console.log('GoLogin Cloud Browser WebSocket URL generated');
-  return { wsEndpoint };
+  // Start the profile - returns a WebSocket URL compatible with Playwright
+  const wsUrl = await GL.start();
+  
+  console.log('GoLogin profile started via SDK, WebSocket URL obtained');
+  return { wsUrl, GL };
 }
 
-async function stopGoLoginProfile(profileId) {
-  // GoLogin Cloud Browser doesn't require explicit stopping
-  // The connection is closed when the browser instance is closed
-  console.log(`GoLogin Cloud Browser session ended for profile: ${profileId}`);
+async function stopGoLoginProfile(GL) {
+  // Stop the profile properly using the SDK
+  if (GL) {
+    try {
+      await GL.stop();
+      console.log('GoLogin profile stopped via SDK');
+    } catch (error) {
+      console.warn('Error stopping GoLogin profile:', error.message);
+    }
+  }
 }
-
 
 // ============================================
 // LinkedIn Login Handler
@@ -388,19 +401,21 @@ async function processAction(action) {
   
   let browser = null;
   let context = null;
+  let GL = null;
   
   try {
-    // Start GoLogin profile
+    // Start GoLogin profile via SDK
     const profileData = await startGoLoginProfile(gologinProfileId);
-    const wsEndpoint = profileData.wsEndpoint || profileData.ws?.puppeteer;
+    const wsUrl = profileData.wsUrl;
+    GL = profileData.GL;
     
-    if (!wsEndpoint) {
-      throw new Error('No WebSocket endpoint returned from GoLogin');
+    if (!wsUrl) {
+      throw new Error('No WebSocket URL returned from GoLogin SDK');
     }
     
-    // Connect with Playwright
+    // Connect with Playwright via CDP
     console.log('Connecting to browser via CDP...');
-    browser = await chromium.connectOverCDP(wsEndpoint);
+    browser = await chromium.connectOverCDP(wsUrl);
     context = browser.contexts()[0] || await browser.newContext();
     const page = context.pages()[0] || await context.newPage();
     
@@ -435,7 +450,7 @@ async function processAction(action) {
     return result;
     
   } finally {
-    // Cleanup
+    // Cleanup browser first
     if (browser) {
       try {
         await browser.close();
@@ -444,8 +459,8 @@ async function processAction(action) {
       }
     }
     
-    // Stop GoLogin profile
-    await stopGoLoginProfile(gologinProfileId);
+    // Stop GoLogin profile via SDK
+    await stopGoLoginProfile(GL);
   }
 }
 
