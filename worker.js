@@ -155,40 +155,22 @@ async function scrollHuman(page, direction = 'down', amount = null) {
 // ============================================
 
 async function startGoLoginProfile(profileId) {
-  console.log(`Starting GoLogin profile: ${profileId}`);
+  console.log(`Connecting to GoLogin Cloud Browser for profile: ${profileId}`);
   
-  const response = await fetch(`https://api.gologin.com/browser/${profileId}/start?autostart=true`, {
-    method: 'GET',
-    headers: {
-      'Authorization': `Bearer ${GOLOGIN_API_TOKEN}`,
-      'Content-Type': 'application/json'
-    }
-  });
-
-  if (!response.ok) {
-    const error = await response.text();
-    throw new Error(`Failed to start GoLogin profile: ${error}`);
-  }
-
-  const data = await response.json();
-  console.log('GoLogin profile started:', data);
-  return data;
+  // GoLogin Cloud Browser direct WebSocket connection
+  // This works with free trial and doesn't require the /browser/start API
+  const wsEndpoint = `wss://cloudbrowser.gologin.com/connect?token=${GOLOGIN_API_TOKEN}&profile=${profileId}`;
+  
+  console.log('GoLogin Cloud Browser WebSocket URL generated');
+  return { wsEndpoint };
 }
 
 async function stopGoLoginProfile(profileId) {
-  console.log(`Stopping GoLogin profile: ${profileId}`);
-  
-  try {
-    await fetch(`https://api.gologin.com/browser/${profileId}/stop`, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${GOLOGIN_API_TOKEN}`
-      }
-    });
-  } catch (error) {
-    console.warn('Error stopping GoLogin profile:', error.message);
-  }
+  // GoLogin Cloud Browser doesn't require explicit stopping
+  // The connection is closed when the browser instance is closed
+  console.log(`GoLogin Cloud Browser session ended for profile: ${profileId}`);
 }
+
 
 // ============================================
 // LinkedIn Login Handler
