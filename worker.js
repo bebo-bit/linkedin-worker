@@ -1,10 +1,9 @@
 import { chromium } from 'playwright-core';
 
-// Configuration from environment - NO SUPABASE SERVICE KEY NEEDED
+// Configuration from environment - Multi-agent worker (no AGENT_ID required)
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const WORKER_SECRET = process.env.WORKER_SECRET;
 const GOLOGIN_API_TOKEN = process.env.GOLOGIN_API_TOKEN;
-const AGENT_ID = process.env.AGENT_ID; // Required: 1:1 worker-agent mapping
 const WORKER_ID = process.env.WORKER_ID || `worker-${Date.now()}`;
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || '5000');
 
@@ -13,13 +12,15 @@ const missingVars = [];
 if (!SUPABASE_URL) missingVars.push('SUPABASE_URL');
 if (!WORKER_SECRET) missingVars.push('WORKER_SECRET');
 if (!GOLOGIN_API_TOKEN) missingVars.push('GOLOGIN_API_TOKEN');
-if (!AGENT_ID) missingVars.push('AGENT_ID');
 
 if (missingVars.length > 0) {
   console.error('Missing required environment variables:', missingVars.join(', '));
-  console.error('Required: SUPABASE_URL, WORKER_SECRET, GOLOGIN_API_TOKEN, AGENT_ID');
+  console.error('Required: SUPABASE_URL, WORKER_SECRET, GOLOGIN_API_TOKEN');
   process.exit(1);
 }
+
+console.log(`Worker ${WORKER_ID} starting in MULTI-AGENT mode`);
+console.log('This worker will process actions for ALL agents in the workspace');
 
 // Statistics
 let actionsProcessed = 0;
@@ -47,11 +48,11 @@ async function callEdgeFunction(functionName, body) {
   return response.json();
 }
 
-async function updateAgentState(loginState, extraData = {}) {
+async function updateAgentState(agentId, loginState, extraData = {}) {
   try {
     await callEdgeFunction('worker-update-agent', {
       workerId: WORKER_ID,
-      agentId: AGENT_ID,
+      agentId,
       loginState,
       ...extraData
     });
@@ -60,11 +61,11 @@ async function updateAgentState(loginState, extraData = {}) {
   }
 }
 
-async function sendHeartbeat(status = 'idle', currentActionId = null) {
+async function sendHeartbeat(status = 'idle', currentActionId = null, agentId = null) {
   try {
     await callEdgeFunction('worker-heartbeat', {
       workerId: WORKER_ID,
-      agentId: AGENT_ID,
+      agentId, // Can be null for multi-agent mode
       status,
       currentActionId,
       actionsProcessed,
@@ -79,7 +80,7 @@ async function pollForActions() {
   try {
     const data = await callEdgeFunction('worker-poll', {
       workerId: WORKER_ID,
-      agentId: AGENT_ID,
+      // No agentId - poll for ALL agents
       limit: 1
     });
     
@@ -193,11 +194,11 @@ async function stopGoLoginProfile(profileId) {
 // LinkedIn Login Handler
 // ============================================
 
-async function handleLinkedInLogin(page, context, action) {
-  console.log('Starting LinkedIn login flow...');
+async function handleLinkedInLogin(page, context, action, agentId) {
+  console.log(`Starting LinkedIn login flow for agent ${agentId}...`);
   
   // Update login state via Edge Function
-  await updateAgentState('navigating');
+  await updateAgentState(agentId, 'navigating');
   
   // Navigate to LinkedIn login
   await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded' });
@@ -206,11 +207,11 @@ async function handleLinkedInLogin(page, context, action) {
   // Check if already logged in
   if (page.url().includes('/feed') || page.url().includes('/mynetwork')) {
     console.log('Already logged in, extracting cookies...');
-    return await extractSessionAndComplete(context);
+    return await extractSessionAndComplete(context, agentId);
   }
   
   // Update state to entering credentials
-  await updateAgentState('entering_credentials');
+  await updateAgentState(agentId, 'entering_credentials');
   
   // Get credentials from action payload (provided by worker-poll)
   const email = action.payload?.email;
@@ -243,7 +244,7 @@ async function handleLinkedInLogin(page, context, action) {
   
   if (requires2FA) {
     console.log('2FA required, waiting for user completion...');
-    await updateAgentState('awaiting_2fa', { twoFAMethod: requires2FA.method });
+    await updateAgentState(agentId, 'awaiting_2fa', { twoFAMethod: requires2FA.method });
     
     // Wait for 2FA completion (up to 5 minutes)
     const loginCompleted = await waitFor2FACompletion(page, 300000);
@@ -254,7 +255,7 @@ async function handleLinkedInLogin(page, context, action) {
   }
   
   // Verify successful login
-  await updateAgentState('verifying_session');
+  await updateAgentState(agentId, 'verifying_session');
   
   const isLoggedIn = await verifyLogin(page);
   if (!isLoggedIn) {
@@ -262,7 +263,7 @@ async function handleLinkedInLogin(page, context, action) {
   }
   
   // Extract and save session
-  return await extractSessionAndComplete(context);
+  return await extractSessionAndComplete(context, agentId);
 }
 
 async function check2FARequired(page) {
@@ -351,8 +352,8 @@ async function verifyLogin(page) {
   return false;
 }
 
-async function extractSessionAndComplete(context) {
-  await updateAgentState('extracting_profile');
+async function extractSessionAndComplete(context, agentId) {
+  await updateAgentState(agentId, 'extracting_profile');
   
   // Get all cookies
   const cookies = await context.cookies();
@@ -370,7 +371,7 @@ async function extractSessionAndComplete(context) {
   // Update agent via Edge Function with session cookies
   await callEdgeFunction('worker-update-agent', {
     workerId: WORKER_ID,
-    agentId: AGENT_ID,
+    agentId,
     loginState: 'completed',
     status: 'connected',
     loginError: null,
@@ -394,7 +395,8 @@ async function extractSessionAndComplete(context) {
 // ============================================
 
 async function processAction(action) {
-  console.log(`Processing action: ${action.action_type} (${action.id})`);
+  const agentId = action.agent_id;
+  console.log(`Processing action: ${action.action_type} (${action.id}) for agent ${agentId}`);
   
   // Get GoLogin profile ID from enriched action data
   const gologinProfileId = action.gologin_profile?.profile_id;
@@ -429,7 +431,7 @@ async function processAction(action) {
     switch (action.action_type) {
       case 'linkedin_login':
       case 'login': // Handle both for backwards compatibility
-        result = await handleLinkedInLogin(page, context, action);
+        result = await handleLinkedInLogin(page, context, action, agentId);
         break;
       
       case 'view_profile':
@@ -500,9 +502,11 @@ async function handleSendConnection(page, action) {
       }
     }
     
-    // Send
-    await clickHuman(page, 'button:has-text("Send")');
-    await humanDelay(1000, 2000);
+    // Send the request
+    const sendBtn = page.locator('button:has-text("Send")').first();
+    if (await sendBtn.isVisible()) {
+      await clickHuman(page, 'button:has-text("Send")');
+    }
     
     return { success: true, message: 'Connection request sent' };
   }
@@ -514,9 +518,8 @@ async function handleSendMessage(page, action) {
   const profileUrl = action.payload?.linkedin_url || action.lead?.linkedin_url;
   const message = action.payload?.message;
   
-  if (!profileUrl || !message) {
-    throw new Error('Profile URL and message required');
-  }
+  if (!profileUrl) throw new Error('No profile URL provided');
+  if (!message) throw new Error('No message provided');
   
   await page.goto(profileUrl, { waitUntil: 'domcontentloaded' });
   await humanDelay(2000, 4000);
@@ -525,84 +528,102 @@ async function handleSendMessage(page, action) {
   const messageBtn = page.locator('button:has-text("Message")').first();
   if (await messageBtn.isVisible()) {
     await clickHuman(page, 'button:has-text("Message")');
-    await humanDelay(1500, 3000);
+    await humanDelay(1000, 2000);
     
     // Type message
     await typeHuman(page, '.msg-form__contenteditable', message);
     await humanDelay(500, 1000);
     
     // Send
-    await clickHuman(page, 'button:has-text("Send")');
-    await humanDelay(1000, 2000);
-    
-    return { success: true, message: 'Message sent' };
+    const sendBtn = page.locator('.msg-form__send-button').first();
+    if (await sendBtn.isVisible()) {
+      await sendBtn.click();
+      return { success: true, message: 'Message sent' };
+    }
   }
   
   return { success: false, message: 'Message button not found' };
 }
 
 // ============================================
-// Main loop
+// Main Loop
 // ============================================
 
-let isRunning = true;
-
 async function main() {
-  console.log('========================================');
-  console.log('LinkedIn Automation Worker Starting');
-  console.log(`Worker ID: ${WORKER_ID}`);
-  console.log(`Agent ID: ${AGENT_ID}`);
-  console.log(`Poll Interval: ${POLL_INTERVAL}ms`);
-  console.log('Architecture: Secure (Edge Functions only)');
-  console.log('========================================');
+  console.log(`Worker ${WORKER_ID} started`);
+  console.log(`Supabase URL: ${SUPABASE_URL}`);
+  console.log(`Poll interval: ${POLL_INTERVAL}ms`);
+  console.log('Mode: MULTI-AGENT (handles all agents in workspace)');
   
-  while (isRunning) {
+  // Send initial heartbeat
+  await sendHeartbeat('online');
+  
+  // Main polling loop
+  while (true) {
     try {
+      // Send heartbeat
       await sendHeartbeat('polling');
       
+      // Poll for actions (from any agent)
       const action = await pollForActions();
       
       if (action) {
-        console.log(`\n>>> Received action: ${action.action_type}`);
-        await sendHeartbeat('processing', action.id);
+        console.log(`Received action: ${action.action_type} (${action.id}) for agent ${action.agent_id}`);
+        
+        // Update heartbeat with current action
+        await sendHeartbeat('busy', action.id, action.agent_id);
         
         try {
+          // Process the action
           const result = await processAction(action);
+          
+          // Report success
           await reportResult(action.id, 'completed', result);
           actionsProcessed++;
-          console.log(`<<< Action completed: ${action.id}`);
+          
+          console.log(`Action ${action.id} completed successfully`);
+          
         } catch (error) {
-          console.error(`<<< Action failed: ${error.message}`);
+          console.error(`Action ${action.id} failed:`, error.message);
+          
+          // Report failure
           await reportResult(action.id, 'failed', null, error.message);
           actionsFailed++;
           
-          // Update agent login state if it was a login action
+          // Update agent state if it was a login action
           if (action.action_type === 'linkedin_login' || action.action_type === 'login') {
-            await updateAgentState('failed', { loginError: error.message });
+            await updateAgentState(action.agent_id, 'failed', {
+              status: 'needs_reauth',
+              loginError: error.message
+            });
           }
         }
       }
-      
-      await sendHeartbeat('idle');
       
     } catch (error) {
       console.error('Main loop error:', error.message);
     }
     
+    // Wait before next poll
     await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL));
   }
 }
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-  console.log('\nShutting down gracefully...');
-  isRunning = false;
+// Handle graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Received SIGTERM, shutting down...');
+  await sendHeartbeat('offline');
+  process.exit(0);
 });
 
-process.on('SIGTERM', () => {
-  console.log('\nReceived SIGTERM, shutting down...');
-  isRunning = false;
+process.on('SIGINT', async () => {
+  console.log('Received SIGINT, shutting down...');
+  await sendHeartbeat('offline');
+  process.exit(0);
 });
 
-// Start
-main().catch(console.error);
+// Start the worker
+main().catch(error => {
+  console.error('Fatal error:', error);
+  process.exit(1);
+});
