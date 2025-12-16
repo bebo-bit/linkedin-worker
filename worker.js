@@ -156,26 +156,78 @@ async function scrollHuman(page, direction = 'down', amount = null) {
 // ============================================
 
 async function startGoLoginProfile(profileId, maxRetries = 3) {
-  console.log(`Connecting to GoLogin Cloud Browser: ${profileId}`);
+  console.log(`Starting GoLogin Cloud Browser: ${profileId}`);
   
   let lastError;
   
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      // GoLogin Cloud Browser WebSocket URL
-      // This connects to GoLogin's cloud infrastructure - no local Chrome needed
-      const wsUrl = `wss://cloudbrowser.gologin.com/connect?token=${GOLOGIN_API_TOKEN}&profile=${profileId}`;
+      // Step 1: Start the profile via GoLogin REST API
+      console.log(`Attempt ${attempt}: Starting profile via GoLogin API...`);
       
-      console.log(`Attempt ${attempt}: Connecting to GoLogin cloud browser...`);
+      const startResponse = await fetch(`https://api.gologin.com/browser/${profileId}/start?autoClose=false`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${GOLOGIN_API_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+      });
       
-      // Connect via Playwright's CDP connection
+      if (!startResponse.ok) {
+        const errorText = await startResponse.text();
+        const status = startResponse.status;
+        
+        if (status === 403 || status === 401) {
+          throw new Error(`GoLogin API access denied (${status}). Check your API token.`);
+        }
+        if (status === 404) {
+          throw new Error(`GoLogin profile not found (404). Profile ID: ${profileId}`);
+        }
+        if (status === 409) {
+          // Profile already running - try to get existing session
+          console.log('Profile already running, attempting to connect to existing session...');
+          const statusResponse = await fetch(`https://api.gologin.com/browser/${profileId}/status`, {
+            method: 'GET',
+            headers: {
+              'Authorization': `Bearer ${GOLOGIN_API_TOKEN}`,
+            },
+          });
+          if (statusResponse.ok) {
+            const statusData = await statusResponse.json();
+            if (statusData.wsUrl) {
+              const browser = await chromium.connectOverCDP(statusData.wsUrl, { timeout: 90000 });
+              console.log('Connected to existing GoLogin session');
+              return { browser, wsUrl: statusData.wsUrl, profileId, isCloud: true };
+            }
+          }
+          // If we can't get existing session, stop and restart
+          await stopGoLoginProfileAPI(profileId);
+          await new Promise(r => setTimeout(r, 2000));
+          continue; // Retry the loop
+        }
+        
+        throw new Error(`Failed to start profile: ${status} - ${errorText}`);
+      }
+      
+      const startData = await startResponse.json();
+      console.log('GoLogin API response:', JSON.stringify(startData, null, 2));
+      
+      const wsUrl = startData.wsUrl || startData.ws?.puppeteer;
+      
+      if (!wsUrl) {
+        throw new Error(`No WebSocket URL returned from GoLogin API. Response: ${JSON.stringify(startData)}`);
+      }
+      
+      console.log(`Got WebSocket URL from GoLogin API: ${wsUrl.substring(0, 50)}...`);
+      
+      // Step 2: Connect via Playwright's CDP connection
       const browser = await chromium.connectOverCDP(wsUrl, {
         timeout: 90000, // 90 second connection timeout
       });
       
       console.log(`Connected to GoLogin Cloud Browser (attempt ${attempt})`);
       
-      return { browser, wsUrl, isCloud: true };
+      return { browser, wsUrl, profileId, isCloud: true };
       
     } catch (error) {
       lastError = error;
@@ -183,14 +235,13 @@ async function startGoLoginProfile(profileId, maxRetries = 3) {
       
       console.warn(`Cloud connection failed (attempt ${attempt}/${maxRetries}): ${errorMsg}`);
       
-      // Check for specific error types
-      if (errorMsg.includes('403') || errorMsg.includes('Forbidden')) {
-        // Profile access denied - don't retry
-        throw new Error(`GoLogin profile access denied (403). Profile may not exist or token mismatch.`);
+      // Check for non-retryable errors
+      if (errorMsg.includes('access denied') || errorMsg.includes('401') || errorMsg.includes('403')) {
+        throw error;
       }
       
-      if (errorMsg.includes('404') || errorMsg.includes('not found')) {
-        throw new Error(`GoLogin profile not found (404). Profile ID: ${profileId}`);
+      if (errorMsg.includes('not found') || errorMsg.includes('404')) {
+        throw error;
       }
       
       // Check if error is retryable (transient failures)
@@ -205,7 +256,8 @@ async function startGoLoginProfile(profileId, maxRetries = 3) {
         errorMsg.includes('ETIMEDOUT') ||
         errorMsg.includes('network') ||
         errorMsg.includes('socket hang up') ||
-        errorMsg.includes('WebSocket');
+        errorMsg.includes('WebSocket') ||
+        errorMsg.includes('409');
       
       if (isRetryable && attempt < maxRetries) {
         const delay = Math.pow(2, attempt) * 2000; // 4s, 8s, 16s exponential backoff
@@ -220,16 +272,42 @@ async function startGoLoginProfile(profileId, maxRetries = 3) {
   throw lastError;
 }
 
-async function stopGoLoginProfile(browser) {
-  // For cloud browser, just close the connection
+// Helper to stop profile via API only (no browser close)
+async function stopGoLoginProfileAPI(profileId) {
+  if (!profileId) return;
+  
+  try {
+    console.log(`Stopping GoLogin profile via API: ${profileId}`);
+    const response = await fetch(`https://api.gologin.com/browser/${profileId}/stop`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${GOLOGIN_API_TOKEN}`,
+      },
+    });
+    
+    if (response.ok) {
+      console.log('GoLogin profile stopped via API');
+    } else {
+      console.warn(`Failed to stop profile via API: ${response.status}`);
+    }
+  } catch (error) {
+    console.warn('Error stopping GoLogin profile via API:', error.message);
+  }
+}
+
+async function stopGoLoginProfile(browser, profileId = null) {
+  // Close the browser connection first
   if (browser) {
     try {
       await browser.close();
-      console.log('GoLogin Cloud Browser connection closed');
+      console.log('Browser connection closed');
     } catch (error) {
-      console.warn('Error closing cloud browser:', error.message);
+      console.warn('Error closing browser:', error.message);
     }
   }
+  
+  // Stop the profile in GoLogin via API
+  await stopGoLoginProfileAPI(profileId);
 }
 
 // ============================================
@@ -1138,8 +1216,8 @@ async function processAction(action) {
     return result;
     
   } finally {
-    // Cleanup: close cloud browser connection
-    await stopGoLoginProfile(browser);
+    // Cleanup: close cloud browser connection and stop profile
+    await stopGoLoginProfile(browser, gologinProfileId);
   }
 }
 
