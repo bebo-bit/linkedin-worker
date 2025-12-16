@@ -1,5 +1,4 @@
 import { chromium } from 'playwright-core';
-import GoLogin from 'gologin';
 
 // Configuration from environment - Multi-agent worker (no AGENT_ID required)
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -22,6 +21,7 @@ if (missingVars.length > 0) {
 
 console.log(`Worker ${WORKER_ID} starting in MULTI-AGENT mode`);
 console.log('This worker will process actions for ALL agents in the workspace');
+console.log('Using GoLogin Cloud Browser (no local Chrome needed)');
 
 // Statistics
 let actionsProcessed = 0;
@@ -152,33 +152,46 @@ async function scrollHuman(page, direction = 'down', amount = null) {
 }
 
 // ============================================
-// GoLogin SDK integration
+// GoLogin Cloud Browser Connection
 // ============================================
 
 async function startGoLoginProfile(profileId, maxRetries = 3) {
-  console.log(`Starting GoLogin profile via SDK: ${profileId}`);
+  console.log(`Connecting to GoLogin Cloud Browser: ${profileId}`);
   
   let lastError;
   
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      // Create GoLogin instance with the SDK
-      const GL = new GoLogin({
-        token: GOLOGIN_API_TOKEN,
-        profile_id: profileId,
-        // Run headless on Railway (no display available)
-        extra_params: ['--headless=new'],
+      // GoLogin Cloud Browser WebSocket URL
+      // This connects to GoLogin's cloud infrastructure - no local Chrome needed
+      const wsUrl = `wss://cloudbrowser.gologin.com/connect?token=${GOLOGIN_API_TOKEN}&profile=${profileId}`;
+      
+      console.log(`Attempt ${attempt}: Connecting to GoLogin cloud browser...`);
+      
+      // Connect via Playwright's CDP connection
+      const browser = await chromium.connectOverCDP(wsUrl, {
+        timeout: 90000, // 90 second connection timeout
       });
       
-      // Start the profile - returns a WebSocket URL compatible with Playwright
-      const wsUrl = await GL.start();
+      console.log(`Connected to GoLogin Cloud Browser (attempt ${attempt})`);
       
-      console.log(`GoLogin profile started (attempt ${attempt}), WebSocket URL obtained`);
-      return { wsUrl, GL };
+      return { browser, wsUrl, isCloud: true };
       
     } catch (error) {
       lastError = error;
       const errorMsg = error.message || String(error);
+      
+      console.warn(`Cloud connection failed (attempt ${attempt}/${maxRetries}): ${errorMsg}`);
+      
+      // Check for specific error types
+      if (errorMsg.includes('403') || errorMsg.includes('Forbidden')) {
+        // Profile access denied - don't retry
+        throw new Error(`GoLogin profile access denied (403). Profile may not exist or token mismatch.`);
+      }
+      
+      if (errorMsg.includes('404') || errorMsg.includes('not found')) {
+        throw new Error(`GoLogin profile not found (404). Profile ID: ${profileId}`);
+      }
       
       // Check if error is retryable (transient failures)
       const isRetryable = 
@@ -191,15 +204,14 @@ async function startGoLoginProfile(profileId, maxRetries = 3) {
         errorMsg.includes('timeout') ||
         errorMsg.includes('ETIMEDOUT') ||
         errorMsg.includes('network') ||
-        errorMsg.includes('socket hang up');
+        errorMsg.includes('socket hang up') ||
+        errorMsg.includes('WebSocket');
       
       if (isRetryable && attempt < maxRetries) {
-        const delay = Math.pow(2, attempt) * 1000; // 2s, 4s, 8s exponential backoff
-        console.warn(`GoLogin start failed (attempt ${attempt}/${maxRetries}): ${errorMsg}`);
+        const delay = Math.pow(2, attempt) * 2000; // 4s, 8s, 16s exponential backoff
         console.log(`Retrying in ${delay/1000}s...`);
         await new Promise(r => setTimeout(r, delay));
-      } else {
-        console.error(`GoLogin start failed permanently: ${errorMsg}`);
+      } else if (!isRetryable) {
         throw error;
       }
     }
@@ -208,14 +220,14 @@ async function startGoLoginProfile(profileId, maxRetries = 3) {
   throw lastError;
 }
 
-async function stopGoLoginProfile(GL) {
-  // Stop the profile properly using the SDK
-  if (GL) {
+async function stopGoLoginProfile(browser) {
+  // For cloud browser, just close the connection
+  if (browser) {
     try {
-      await GL.stop();
-      console.log('GoLogin profile stopped via SDK');
+      await browser.close();
+      console.log('GoLogin Cloud Browser connection closed');
     } catch (error) {
-      console.warn('Error stopping GoLogin profile:', error.message);
+      console.warn('Error closing cloud browser:', error.message);
     }
   }
 }
@@ -376,8 +388,9 @@ async function handleLinkedInLogin(page, context, action, agentId) {
   await updateAgentState(agentId, 'entering_credentials');
   
   // Get credentials from action payload (provided by worker-poll)
-  const email = action.payload?.email;
-  const password = action.payload?.password;
+  // Support both naming conventions: email/password and linkedinEmail/linkedinPassword
+  const email = action.payload?.email || action.payload?.linkedinEmail;
+  const password = action.payload?.password || action.payload?.linkedinPassword;
   
   if (!email || !password) {
     throw new Error('LinkedIn credentials not provided in action payload');
@@ -605,22 +618,15 @@ async function processAction(action) {
   
   let browser = null;
   let context = null;
-  let GL = null;
   
   try {
-    // Start GoLogin profile via SDK
+    // Connect to GoLogin Cloud Browser
     const profileData = await startGoLoginProfile(gologinProfileId);
-    const wsUrl = profileData.wsUrl;
-    GL = profileData.GL;
+    browser = profileData.browser;
     
-    if (!wsUrl) {
-      throw new Error('No WebSocket URL returned from GoLogin SDK');
-    }
-    
-    // Connect with Playwright via CDP
-    console.log('Connecting to browser via CDP...');
-    browser = await chromium.connectOverCDP(wsUrl);
-    context = browser.contexts()[0] || await browser.newContext();
+    // Get existing context or create new one
+    const contexts = browser.contexts();
+    context = contexts[0] || await browser.newContext();
     const page = context.pages()[0] || await context.newPage();
     
     // Set viewport
@@ -654,17 +660,8 @@ async function processAction(action) {
     return result;
     
   } finally {
-    // Cleanup browser first
-    if (browser) {
-      try {
-        await browser.close();
-      } catch (e) {
-        console.warn('Error closing browser:', e.message);
-      }
-    }
-    
-    // Stop GoLogin profile via SDK
-    await stopGoLoginProfile(GL);
+    // Cleanup: close cloud browser connection
+    await stopGoLoginProfile(browser);
   }
 }
 
@@ -755,6 +752,7 @@ async function main() {
   console.log(`Supabase URL: ${SUPABASE_URL}`);
   console.log(`Poll interval: ${POLL_INTERVAL}ms`);
   console.log('Mode: MULTI-AGENT (handles all agents in workspace)');
+  console.log('Browser: GoLogin Cloud Browser (remote)');
   
   // Send initial heartbeat
   await sendHeartbeat('online');
