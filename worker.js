@@ -236,279 +236,204 @@ async function stopGoLoginProfile(browser) {
 // LinkedIn Login Handler
 // ============================================
 
-// Check for app approval requirement (different from SMS/Email 2FA)
-async function checkAppApprovalRequired(page) {
+// Comprehensive challenge detection - distinguishes between different LinkedIn security challenges
+async function detectChallengeType(page) {
   const pageText = await page.textContent('body').catch(() => '');
-  const appApprovalIndicators = [
-    'Approve this sign-in from your LinkedIn app',
-    'Open the LinkedIn app to confirm',
-    'Confirm it\'s you',
-    'We sent a notification to your LinkedIn app',
-    'Approve from the LinkedIn app'
+  const lowerText = pageText.toLowerCase();
+  const url = page.url().toLowerCase();
+  
+  console.log('=== Challenge Detection Debug ===');
+  console.log('Current URL:', url);
+  console.log('Page text preview (first 500 chars):', lowerText.substring(0, 500));
+  
+  // 1. Check for CAPTCHA first (highest priority blocker)
+  const captchaIframe = await page.locator('iframe[src*="captcha"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="arkose"]').first();
+  if (await captchaIframe.isVisible({ timeout: 1000 }).catch(() => false)) {
+    console.log('CAPTCHA DETECTED: Found captcha iframe');
+    return { type: 'captcha', indicator: 'captcha_iframe' };
+  }
+  
+  const captchaIndicators = [
+    'prove you\'re human',
+    'security verification required',
+    'complete the security check',
+    'verify you\'re not a robot'
   ];
+  for (const indicator of captchaIndicators) {
+    if (lowerText.includes(indicator)) {
+      console.log(`CAPTCHA DETECTED: matched "${indicator}"`);
+      return { type: 'captcha', indicator };
+    }
+  }
   
+  // 2. Check for invalid credentials
+  const invalidCredentialIndicators = [
+    'that\'s not the right password',
+    'wrong password',
+    'incorrect password',
+    'please check your password',
+    'couldn\'t find a linkedin account',
+    'couldn\'t find an account',
+    'please enter a valid email'
+  ];
+  for (const indicator of invalidCredentialIndicators) {
+    if (lowerText.includes(indicator)) {
+      console.log(`INVALID CREDENTIALS DETECTED: matched "${indicator}"`);
+      return { type: 'invalid_credentials', indicator };
+    }
+  }
+  
+  // 3. Check for account locked/restricted
+  const accountLockedIndicators = [
+    'account has been restricted',
+    'your account has been temporarily restricted',
+    'we\'ve restricted your account',
+    'temporarily locked',
+    'unusual activity detected',
+    'account is temporarily restricted'
+  ];
+  for (const indicator of accountLockedIndicators) {
+    if (lowerText.includes(indicator)) {
+      console.log(`ACCOUNT LOCKED DETECTED: matched "${indicator}"`);
+      return { type: 'account_locked', indicator };
+    }
+  }
+  
+  // 4. Check for LinkedIn App Push Notification (VERY SPECIFIC phrases only)
+  const appApprovalIndicators = [
+    'approve this sign-in from your linkedin app',
+    'open the linkedin app to confirm',
+    'we sent a notification to your linkedin app',
+    'approve from the linkedin app',
+    'tap yes on the linkedin app',
+    'check your linkedin app',
+    'we\'ll send a push notification'
+  ];
   for (const indicator of appApprovalIndicators) {
-    if (pageText.toLowerCase().includes(indicator.toLowerCase())) {
-      console.log('App approval detected via text:', indicator);
-      return true;
+    if (lowerText.includes(indicator)) {
+      console.log(`APP APPROVAL DETECTED: matched "${indicator}"`);
+      return { type: 'app_approval', indicator };
     }
   }
   
-  // Also check for: on checkpoint page but no OTP input = likely app approval
-  const url = page.url();
-  if (url.includes('checkpoint')) {
-    const hasOTPInput = await page.locator('input[name="pin"]').isVisible({ timeout: 1000 }).catch(() => false);
-    const hasCodeInput = await page.locator('input[placeholder*="code"]').isVisible({ timeout: 500 }).catch(() => false);
-    if (!hasOTPInput && !hasCodeInput) {
-      console.log('On checkpoint page but no OTP input - likely app approval');
-      return true;
+  // 5. Check for Email/SMS 2FA (code entry)
+  const emailSms2FAIndicators = [
+    'enter the code we sent',
+    'we sent a code to',
+    'check your email for a code',
+    'check your phone for a code',
+    'enter the 6 digit code',
+    'enter the 6-digit code',
+    'verification code sent',
+    'we\'ve sent a verification code'
+  ];
+  for (const indicator of emailSms2FAIndicators) {
+    if (lowerText.includes(indicator)) {
+      console.log(`EMAIL/SMS 2FA DETECTED: matched "${indicator}"`);
+      // Determine if email or SMS
+      const method = lowerText.includes('phone') || lowerText.includes('sms') || lowerText.includes('text message') ? 'sms' : 'email';
+      return { type: 'email_sms_2fa', indicator, method };
     }
   }
   
-  return false;
+  // 6. Check for Authenticator App 2FA
+  const authenticator2FAIndicators = [
+    'authenticator app',
+    'authentication app',
+    'google authenticator',
+    'microsoft authenticator',
+    'enter the code from your authenticator'
+  ];
+  for (const indicator of authenticator2FAIndicators) {
+    if (lowerText.includes(indicator)) {
+      console.log(`AUTHENTICATOR 2FA DETECTED: matched "${indicator}"`);
+      return { type: 'authenticator_2fa', indicator };
+    }
+  }
+  
+  // 7. Check if on checkpoint/challenge page with code input field
+  if (url.includes('checkpoint') || url.includes('challenge') || url.includes('two-step')) {
+    // Check for code input fields
+    const codeInputSelectors = [
+      'input[name="pin"]',
+      '#input__phone_verification_pin',
+      '#input__email_verification_pin',
+      '[data-test="verification-code-input"]',
+      'input[placeholder*="code" i]',
+      'input[aria-label*="code" i]',
+      'input[maxlength="6"]'
+    ];
+    
+    for (const selector of codeInputSelectors) {
+      const element = await page.locator(selector).first();
+      if (await element.isVisible({ timeout: 500 }).catch(() => false)) {
+        console.log(`2FA CODE INPUT DETECTED: found "${selector}"`);
+        
+        // Try to determine type from surrounding text
+        if (lowerText.includes('phone') || lowerText.includes('sms')) {
+          return { type: 'email_sms_2fa', indicator: selector, method: 'sms' };
+        } else if (lowerText.includes('email')) {
+          return { type: 'email_sms_2fa', indicator: selector, method: 'email' };
+        }
+        return { type: 'email_sms_2fa', indicator: selector, method: 'unknown' };
+      }
+    }
+    
+    // On checkpoint but NO code input - check for app approval button/text more broadly
+    const hasApproveTapButton = await page.locator('button:has-text("I\'ve approved"), button:has-text("Done")').first().isVisible({ timeout: 500 }).catch(() => false);
+    if (hasApproveTapButton) {
+      console.log('APP APPROVAL DETECTED: Found approval confirmation button on checkpoint page');
+      return { type: 'app_approval', indicator: 'approval_button_present' };
+    }
+    
+    // Generic checkpoint with no clear indicator - DON'T assume app approval
+    console.log('UNKNOWN CHALLENGE: On checkpoint page but no clear indicator');
+    return { type: 'unknown_challenge', indicator: 'generic_checkpoint' };
+  }
+  
+  // 8. Handle generic "Confirm it's you" - need more context
+  if (lowerText.includes('confirm it\'s you') || lowerText.includes('let\'s do a quick security check')) {
+    // Check what options are available on the page
+    const hasSendCodeButton = await page.locator('button:has-text("Send"), button:has-text("Get code")').first().isVisible({ timeout: 500 }).catch(() => false);
+    if (hasSendCodeButton) {
+      console.log('EMAIL/SMS 2FA DETECTED: Security check with send code option');
+      return { type: 'email_sms_2fa', indicator: 'security_check_send_code', method: 'unknown' };
+    }
+    
+    // Don't assume - this could be many things
+    console.log('UNKNOWN CHALLENGE: Generic security check page');
+    return { type: 'unknown_challenge', indicator: 'generic_security_check' };
+  }
+  
+  return { type: 'none', indicator: null };
 }
 
-// Check for login failure (bad password, account locked)
+// Check for login failure (bad password, account locked) - LEGACY, uses detectChallengeType internally
 async function checkLoginFailed(page) {
-  const pageText = await page.textContent('body').catch(() => '');
-  const url = page.url();
+  const challenge = await detectChallengeType(page);
   
-  const errorIndicators = [
-    { text: "that's not the right password", type: 'invalid_credentials' },
-    { text: "wrong password", type: 'invalid_credentials' },
-    { text: "incorrect password", type: 'invalid_credentials' },
-    { text: "please check your password", type: 'invalid_credentials' },
-    { text: "couldn't find a linkedin account", type: 'invalid_credentials' },
-    { text: "account has been restricted", type: 'account_locked' },
-    { text: "temporarily locked", type: 'account_locked' },
-    { text: "unusual activity", type: 'account_locked' },
-    { text: "your account has been temporarily restricted", type: 'account_locked' },
-    { text: "we've restricted your account", type: 'account_locked' },
-  ];
-  
-  const lowerText = pageText.toLowerCase();
-  
-  for (const indicator of errorIndicators) {
-    if (lowerText.includes(indicator.text)) {
-      console.log(`Login error detected: ${indicator.type} - "${indicator.text}"`);
-      return { failed: true, type: indicator.type };
-    }
+  if (challenge.type === 'invalid_credentials') {
+    return { failed: true, type: 'invalid_credentials' };
   }
-  
-  // Check: still on login page after submission = possible error
-  if (url.includes('/login') || url.includes('/uas/login')) {
-    // Check for visible error banner
-    const errorBanner = await page.locator('.form__label--error, [data-test="form-error"], .alert-error').isVisible({ timeout: 1000 }).catch(() => false);
-    if (errorBanner) {
-      console.log('Error banner detected on login page');
-      return { failed: true, type: 'invalid_credentials' };
-    }
+  if (challenge.type === 'account_locked') {
+    return { failed: true, type: 'account_locked' };
   }
   
   return null;
 }
 
-// Validate full session cookies for confidence
-async function validateFullSession(context) {
-  const cookies = await context.cookies();
-  
-  const liAtCookie = cookies.find(c => c.name === 'li_at');
-  const jsessionId = cookies.find(c => c.name === 'JSESSIONID');
-  const bcookie = cookies.find(c => c.name === 'bcookie');
-  const liACookie = cookies.find(c => c.name === 'li_a');
-  
-  // li_at is the crown jewel - must have this
-  if (!liAtCookie || !liAtCookie.value) {
-    return { valid: false, reason: 'Missing li_at cookie' };
-  }
-  
-  // Calculate confidence based on additional cookies
-  const confidenceSignals = {
-    hasLiAt: !!liAtCookie?.value,
-    hasLiA: !!liACookie?.value,
-    hasJSessionId: !!jsessionId?.value,
-    hasBcookie: !!bcookie?.value,
-  };
-  
-  const confidence = Object.values(confidenceSignals).filter(Boolean).length / 4;
-  
-  console.log(`Session validation: li_at=${!!liAtCookie?.value}, confidence=${(confidence * 100).toFixed(0)}%`);
-  
-  return { 
-    valid: true, 
-    cookies: { 
-      li_at: liAtCookie.value,
-      li_a: liACookie?.value || null
-    },
-    confidence
-  };
+// Check for app approval - LEGACY wrapper
+async function checkAppApprovalRequired(page) {
+  const challenge = await detectChallengeType(page);
+  return challenge.type === 'app_approval';
 }
 
-async function handleLinkedInLogin(page, context, action, agentId) {
-  console.log(`Starting LinkedIn login flow for agent ${agentId}...`);
-  
-  // CRITICAL: Check if we have valid existing cookies - NEVER re-enter credentials if so
-  const existingCookies = action.payload?.existingCookies;
-  if (existingCookies?.li_at) {
-    console.log('Existing session cookies found - attempting cookie-based login...');
-    
-    // Set cookies first before navigating
-    await context.addCookies([
-      { name: 'li_at', value: existingCookies.li_at, domain: '.linkedin.com', path: '/' },
-      ...(existingCookies.li_a ? [{ name: 'li_a', value: existingCookies.li_a, domain: '.linkedin.com', path: '/' }] : [])
-    ]);
-    
-    // Navigate to feed to verify session
-    await page.goto('https://www.linkedin.com/feed', { waitUntil: 'domcontentloaded' });
-    await humanDelay(2000, 4000);
-    
-    const isValid = await verifyLogin(page);
-    if (isValid) {
-      console.log('Existing cookies valid - session restored without re-login');
-      return await extractSessionAndComplete(context, agentId);
-    }
-    
-    console.log('Existing cookies invalid - falling back to full login');
-  }
-  
-  // Update login state via Edge Function
-  await updateAgentState(agentId, 'navigating');
-  
-  // Navigate to LinkedIn login
-  await page.goto('https://www.linkedin.com/login', { waitUntil: 'domcontentloaded' });
-  await humanDelay(2000, 4000);
-  
-  // Check if already logged in (maybe cookies worked after navigation)
-  if (page.url().includes('/feed') || page.url().includes('/mynetwork')) {
-    console.log('Already logged in, extracting cookies...');
-    return await extractSessionAndComplete(context, agentId);
-  }
-  
-  // Update state to entering credentials
-  await updateAgentState(agentId, 'entering_credentials');
-  
-  // Get credentials from action payload (provided by worker-poll)
-  // Support both naming conventions: email/password and linkedinEmail/linkedinPassword
-  const email = action.payload?.email || action.payload?.linkedinEmail;
-  const password = action.payload?.password || action.payload?.linkedinPassword;
-  
-  if (!email || !password) {
-    throw new Error('LinkedIn credentials not provided in action payload');
-  }
-  
-  // Enter email
-  console.log('Entering email...');
-  await typeHuman(page, '#username', email);
-  await humanDelay(500, 1000);
-  
-  // Enter password
-  console.log('Entering password...');
-  await typeHuman(page, '#password', password);
-  await humanDelay(500, 1000);
-  
-  // Click sign in
-  console.log('Clicking sign in...');
-  await clickHuman(page, 'button[type="submit"]');
-  
-  // Wait for navigation
-  await page.waitForLoadState('domcontentloaded');
-  await humanDelay(3000, 5000);
-  
-  // 1. Check for failed login FIRST (don't retry!)
-  const loginError = await checkLoginFailed(page);
-  if (loginError) {
-    const errorMessage = loginError.type === 'invalid_credentials' 
-      ? 'Wrong password - do NOT retry'
-      : 'Account locked by LinkedIn';
-    
-    await updateAgentState(agentId, loginError.type, {
-      status: 'needs_reauth',
-      loginError: errorMessage
-    });
-    
-    throw new Error(`Login failed: ${errorMessage}`);
-  }
-  
-  // 2. Check for app approval (different from SMS/Email 2FA)
-  const needsAppApproval = await checkAppApprovalRequired(page);
-  if (needsAppApproval) {
-    console.log('LinkedIn app approval required...');
-    await updateAgentState(agentId, 'awaiting_app_approval', { twoFAMethod: 'linkedin_app' });
-    
-    // Wait for completion (up to 5 minutes)
-    const completed = await waitFor2FACompletion(page, 300000);
-    if (!completed) {
-      throw new Error('LinkedIn app approval timed out');
-    }
-  }
-  
-  // 3. Check for SMS/Email 2FA
-  const requires2FA = await check2FARequired(page);
-  if (requires2FA) {
-    console.log('2FA required, waiting for user completion...');
-    await updateAgentState(agentId, 'awaiting_2fa', { twoFAMethod: requires2FA.method });
-    
-    // Wait for 2FA completion (up to 5 minutes)
-    const loginCompleted = await waitFor2FACompletion(page, 300000);
-    
-    if (!loginCompleted) {
-      throw new Error('2FA verification timed out');
-    }
-  }
-  
-  // Verify successful login
-  await updateAgentState(agentId, 'verifying_session');
-  
-  const isLoggedIn = await verifyLogin(page);
-  if (!isLoggedIn) {
-    // Final check for any error state we missed
-    const finalError = await checkLoginFailed(page);
-    if (finalError) {
-      await updateAgentState(agentId, finalError.type, {
-        status: 'needs_reauth',
-        loginError: `Login verification failed: ${finalError.type}`
-      });
-      throw new Error(`Login failed after verification: ${finalError.type}`);
-    }
-    
-    throw new Error('Login verification failed - not on expected page');
-  }
-  
-  // Extract and save session
-  return await extractSessionAndComplete(context, agentId);
-}
-
+// Check for 2FA requirement - LEGACY wrapper  
 async function check2FARequired(page) {
-  const url = page.url();
+  const challenge = await detectChallengeType(page);
   
-  // Check URL patterns
-  if (url.includes('checkpoint') || url.includes('challenge') || url.includes('two-step')) {
-    console.log('2FA detected via URL pattern');
-  }
-  
-  // Check for various 2FA indicators
-  const indicators = [
-    { selector: 'input[name="pin"]', method: 'app' },
-    { selector: '#input__phone_verification_pin', method: 'sms' },
-    { selector: '#input__email_verification_pin', method: 'email' },
-    { selector: '[data-test="verification-code-input"]', method: 'app' },
-    { selector: 'input[placeholder*="code"]', method: 'app' },
-    { selector: 'input[placeholder*="verification"]', method: 'app' }
-  ];
-  
-  for (const indicator of indicators) {
-    const element = await page.locator(indicator.selector).first();
-    if (await element.isVisible({ timeout: 1000 }).catch(() => false)) {
-      return { required: true, method: indicator.method };
-    }
-  }
-  
-  // Check for text indicators
-  const pageText = await page.textContent('body');
-  if (pageText.includes('verification code') || 
-      pageText.includes('two-step verification') ||
-      pageText.includes('Enter the code')) {
-    return { required: true, method: 'unknown' };
+  if (challenge.type === 'email_sms_2fa' || challenge.type === 'authenticator_2fa') {
+    return { required: true, method: challenge.method || challenge.type };
   }
   
   return null;
@@ -536,6 +461,129 @@ async function waitFor2FACompletion(page, timeout) {
   }
   
   return false;
+}
+
+// Poll for 2FA code from database and enter it on the page
+async function pollAndEnter2FACode(page, agentId, timeout) {
+  const startTime = Date.now();
+  const pollInterval = 3000; // Poll every 3 seconds
+  
+  console.log(`[2FA] Polling for 2FA code for agent ${agentId}...`);
+  
+  while (Date.now() - startTime < timeout) {
+    try {
+      // Fetch agent's 2FA code via edge function
+      const response = await fetch(`${SUPABASE_URL}/functions/v1/worker-poll`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-worker-secret': WORKER_SECRET
+        },
+        body: JSON.stringify({
+          workerId: WORKER_ID,
+          checkAgent2FA: agentId
+        })
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        const twoFACode = data.twoFACode;
+        
+        if (twoFACode && twoFACode.length === 6) {
+          console.log(`[2FA] Received code, entering on page...`);
+          
+          // Find code input field
+          const codeInputSelectors = [
+            'input[name="pin"]',
+            '#input__phone_verification_pin',
+            '#input__email_verification_pin',
+            '[data-test="verification-code-input"]',
+            'input[placeholder*="code" i]',
+            'input[aria-label*="code" i]',
+            'input[maxlength="6"]',
+            'input[type="text"]'
+          ];
+          
+          for (const selector of codeInputSelectors) {
+            const element = await page.locator(selector).first();
+            if (await element.isVisible({ timeout: 500 }).catch(() => false)) {
+              console.log(`[2FA] Found input with selector: ${selector}`);
+              
+              // Clear and enter the code
+              await element.click();
+              await humanDelay(200, 400);
+              await element.fill('');
+              await humanDelay(100, 200);
+              
+              // Type code with human-like delays
+              for (const char of twoFACode) {
+                await element.pressSequentially(char, { delay: Math.random() * 100 + 50 });
+              }
+              
+              await humanDelay(500, 1000);
+              
+              // Find and click submit button
+              const submitSelectors = [
+                'button[type="submit"]',
+                'button:has-text("Submit")',
+                'button:has-text("Verify")',
+                'button:has-text("Next")',
+                '#two-step-submit-button'
+              ];
+              
+              for (const submitSelector of submitSelectors) {
+                const submitBtn = await page.locator(submitSelector).first();
+                if (await submitBtn.isVisible({ timeout: 500 }).catch(() => false)) {
+                  console.log(`[2FA] Clicking submit button: ${submitSelector}`);
+                  await clickHuman(page, submitSelector);
+                  
+                  // Clear the code from the database
+                  await clearAgent2FACode(agentId);
+                  
+                  return true;
+                }
+              }
+              
+              // If no submit button found, code might auto-submit
+              console.log('[2FA] No submit button found, code may auto-submit');
+              await clearAgent2FACode(agentId);
+              return true;
+            }
+          }
+          
+          console.log('[2FA] Code received but no input field found on page');
+        }
+      }
+    } catch (error) {
+      console.error('[2FA] Error polling for code:', error.message);
+    }
+    
+    // Check if we've already navigated away (user manually completed or auto-submit worked)
+    const url = page.url();
+    if (url.includes('/feed') || url.includes('/mynetwork') || url.includes('/in/')) {
+      console.log('[2FA] Already navigated to logged-in page');
+      return true;
+    }
+    
+    await new Promise(resolve => setTimeout(resolve, pollInterval));
+  }
+  
+  console.log('[2FA] Timeout waiting for code');
+  return false;
+}
+
+// Clear the 2FA code from the database after use
+async function clearAgent2FACode(agentId) {
+  try {
+    await callEdgeFunction('worker-update-agent', {
+      workerId: WORKER_ID,
+      agentId,
+      clearTwoFACode: true
+    });
+    console.log('[2FA] Cleared 2FA code from database');
+  } catch (error) {
+    console.error('[2FA] Failed to clear 2FA code:', error.message);
+  }
 }
 
 async function verifyLogin(page) {
@@ -600,6 +648,269 @@ async function extractSessionAndComplete(context, agentId) {
     message: 'LinkedIn login successful',
     hasCookies: true
   };
+}
+
+// ============================================
+// Challenge Debug Logger with Screenshot
+// ============================================
+
+async function logChallengeDebug(page, agentId, challengeType) {
+  try {
+    const url = page.url();
+    const pageText = await page.textContent('body').catch(() => '');
+    
+    // Get all input fields on the page
+    const inputFields = await page.evaluate(() => {
+      const inputs = document.querySelectorAll('input, button');
+      return Array.from(inputs).slice(0, 20).map(el => ({
+        tag: el.tagName,
+        type: el.type || '',
+        name: el.name || '',
+        id: el.id || '',
+        placeholder: el.placeholder || '',
+        text: el.textContent?.substring(0, 50) || '',
+        ariaLabel: el.getAttribute('aria-label') || ''
+      }));
+    });
+    
+    // Take screenshot as base64
+    let screenshotBase64 = '';
+    try {
+      const screenshotBuffer = await page.screenshot({ type: 'png', fullPage: false });
+      screenshotBase64 = screenshotBuffer.toString('base64');
+      console.log(`[DEBUG] Screenshot captured (${screenshotBase64.length} chars base64)`);
+    } catch (screenshotError) {
+      console.error('[DEBUG] Failed to capture screenshot:', screenshotError.message);
+    }
+    
+    // Log detailed debug info
+    console.log('╔════════════════════════════════════════════════════════════╗');
+    console.log('║             CHALLENGE DEBUG INFO                           ║');
+    console.log('╠════════════════════════════════════════════════════════════╣');
+    console.log(`║ Agent ID: ${agentId}`);
+    console.log(`║ Challenge Type: ${challengeType}`);
+    console.log(`║ URL: ${url}`);
+    console.log('╠════════════════════════════════════════════════════════════╣');
+    console.log('║ Page Text (first 1500 chars):');
+    console.log(pageText.substring(0, 1500));
+    console.log('╠════════════════════════════════════════════════════════════╣');
+    console.log('║ Input Fields:', JSON.stringify(inputFields, null, 2));
+    console.log('╚════════════════════════════════════════════════════════════╝');
+    
+    // Log the full screenshot base64 on a separate line for easy extraction from Railway logs
+    if (screenshotBase64) {
+      console.log('[SCREENSHOT_START]');
+      console.log(screenshotBase64);
+      console.log('[SCREENSHOT_END]');
+    }
+    
+    return { url, pageText: pageText.substring(0, 1500), inputFields, screenshotBase64 };
+  } catch (error) {
+    console.error('[DEBUG] Error logging challenge debug:', error.message);
+    return null;
+  }
+}
+
+// ============================================
+// LinkedIn Login Handler (THE MISSING FUNCTION!)
+// ============================================
+
+async function handleLinkedInLogin(page, context, action, agentId) {
+  const payload = action.payload || {};
+  const email = payload.email || payload.linkedinEmail;
+  const password = payload.password || payload.linkedinPassword;
+  const useCookies = payload.useCookies;
+  const liAtCookie = payload.liAtCookie;
+  const liACookie = payload.liACookie;
+  
+  console.log(`[LOGIN] Starting LinkedIn login for agent ${agentId}`);
+  console.log(`[LOGIN] Has email: ${!!email}, Has password: ${!!password}, Use cookies: ${useCookies}`);
+  
+  try {
+    // Step 1: Update status to navigating
+    await updateAgentState(agentId, 'navigating');
+    
+    // Step 2: If using cookies, try cookie-based login first
+    if (useCookies && liAtCookie) {
+      console.log('[LOGIN] Attempting cookie-based login...');
+      await context.addCookies([
+        {
+          name: 'li_at',
+          value: liAtCookie,
+          domain: '.linkedin.com',
+          path: '/',
+          httpOnly: true,
+          secure: true,
+        },
+        ...(liACookie ? [{
+          name: 'li_a',
+          value: liACookie,
+          domain: '.linkedin.com',
+          path: '/',
+          httpOnly: true,
+          secure: true,
+        }] : []),
+      ]);
+      
+      await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'networkidle', timeout: 60000 });
+      
+      if (await verifyLogin(page)) {
+        console.log('[LOGIN] Cookie login successful!');
+        return await extractSessionAndComplete(context, agentId);
+      }
+      console.log('[LOGIN] Cookies invalid or expired, falling back to credentials');
+    }
+    
+    // Step 3: Navigate to LinkedIn login page
+    console.log('[LOGIN] Navigating to LinkedIn login page...');
+    await page.goto('https://www.linkedin.com/login', { waitUntil: 'networkidle', timeout: 60000 });
+    await humanDelay(1500, 2500);
+    
+    // Check if already logged in
+    if (await verifyLogin(page)) {
+      console.log('[LOGIN] Already logged in!');
+      return await extractSessionAndComplete(context, agentId);
+    }
+    
+    // Step 4: Enter credentials
+    if (!email || !password) {
+      throw new Error('Missing email or password for login');
+    }
+    
+    await updateAgentState(agentId, 'entering_credentials');
+    
+    console.log('[LOGIN] Entering email...');
+    await typeHuman(page, 'input#username, input[name="session_key"]', email);
+    await humanDelay(500, 1000);
+    
+    console.log('[LOGIN] Entering password...');
+    await typeHuman(page, 'input#password, input[name="session_password"]', password);
+    await humanDelay(500, 1000);
+    
+    console.log('[LOGIN] Clicking sign in button...');
+    await clickHuman(page, 'button[type="submit"]');
+    
+    // Step 5: Wait for response and check for challenges
+    console.log('[LOGIN] Waiting for response...');
+    await humanDelay(4000, 6000);
+    
+    // Step 6: Detect any challenges
+    const challenge = await detectChallengeType(page);
+    console.log(`[LOGIN] Challenge detection result: ${JSON.stringify(challenge)}`);
+    
+    // ALWAYS log debug info when any challenge is detected
+    if (challenge.type !== 'none') {
+      console.log('[LOGIN] Challenge detected, logging debug info with screenshot...');
+      await logChallengeDebug(page, agentId, challenge.type);
+    }
+    
+    // Step 7: Handle different challenge types
+    switch (challenge.type) {
+      case 'none':
+        // No challenge - check if login succeeded
+        if (await verifyLogin(page)) {
+          console.log('[LOGIN] Login successful - no challenges!');
+          return await extractSessionAndComplete(context, agentId);
+        }
+        // Unknown state
+        console.log('[LOGIN] No challenge detected but not logged in - unknown state');
+        await logChallengeDebug(page, agentId, 'unknown_no_challenge');
+        throw new Error('Login failed - ended in unknown state');
+        
+      case 'invalid_credentials':
+        await updateAgentState(agentId, 'invalid_credentials', {
+          loginError: 'Invalid email or password'
+        });
+        throw new Error('Invalid credentials');
+        
+      case 'account_locked':
+        await updateAgentState(agentId, 'account_locked', {
+          loginError: 'Account is locked or restricted'
+        });
+        throw new Error('Account locked');
+        
+      case 'captcha':
+        await updateAgentState(agentId, 'failed', {
+          loginError: 'CAPTCHA detected - please try again later'
+        });
+        throw new Error('CAPTCHA required');
+        
+      case 'app_approval':
+        console.log('[LOGIN] LinkedIn App Approval required');
+        await updateAgentState(agentId, 'awaiting_app_approval', {
+          twoFAMethod: 'linkedin_app'
+        });
+        
+        // Wait for user to approve in app
+        const approvalCompleted = await waitFor2FACompletion(page, 120000);
+        
+        if (approvalCompleted) {
+          console.log('[LOGIN] App approval completed!');
+          return await extractSessionAndComplete(context, agentId);
+        }
+        throw new Error('App approval timeout');
+        
+      case 'email_sms_2fa':
+        console.log(`[LOGIN] Email/SMS 2FA required (method: ${challenge.method})`);
+        await updateAgentState(agentId, 'awaiting_2fa', {
+          twoFAMethod: challenge.method === 'sms' ? 'sms' : 'email'
+        });
+        
+        // Poll for 2FA code from user and enter it
+        const codeEntered = await pollAndEnter2FACode(page, agentId, 300000);
+        
+        if (codeEntered) {
+          // Wait for navigation after code submission
+          await humanDelay(3000, 5000);
+          
+          if (await verifyLogin(page)) {
+            console.log('[LOGIN] 2FA completed - login successful!');
+            return await extractSessionAndComplete(context, agentId);
+          }
+          
+          // Check for invalid code
+          const afterCodeChallenge = await detectChallengeType(page);
+          if (afterCodeChallenge.type === 'email_sms_2fa') {
+            console.log('[LOGIN] Code may be invalid, still on 2FA page');
+            throw new Error('Invalid 2FA code - please try again');
+          }
+        }
+        throw new Error('2FA timeout - no code received');
+        
+      case 'authenticator_2fa':
+        console.log('[LOGIN] Authenticator 2FA required');
+        await updateAgentState(agentId, 'awaiting_2fa', {
+          twoFAMethod: 'authenticator'
+        });
+        
+        // Poll for authenticator code from user
+        const authCodeEntered = await pollAndEnter2FACode(page, agentId, 300000);
+        
+        if (authCodeEntered) {
+          await humanDelay(3000, 5000);
+          
+          if (await verifyLogin(page)) {
+            console.log('[LOGIN] Authenticator 2FA completed!');
+            return await extractSessionAndComplete(context, agentId);
+          }
+        }
+        throw new Error('Authenticator 2FA timeout');
+        
+      case 'unknown_challenge':
+        console.log('[LOGIN] Unknown challenge type detected');
+        await updateAgentState(agentId, 'failed', {
+          loginError: `Unknown challenge: ${challenge.indicator}`
+        });
+        throw new Error(`Unknown challenge: ${challenge.indicator}`);
+        
+      default:
+        throw new Error(`Unhandled challenge type: ${challenge.type}`);
+    }
+    
+  } catch (error) {
+    console.error('[LOGIN] Login failed:', error.message);
+    throw error;
+  }
 }
 
 // ============================================
