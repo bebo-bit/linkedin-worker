@@ -586,6 +586,119 @@ async function clearAgent2FACode(agentId) {
   }
 }
 
+// Wait for CAPTCHA to be solved by user (polls database for resolution)
+async function waitForCaptchaSolved(page, agentId, timeout) {
+  const startTime = Date.now();
+  const pollInterval = 5000; // Poll every 5 seconds
+  const screenshotInterval = 15000; // Update screenshot every 15 seconds
+  let lastScreenshotTime = 0;
+  
+  console.log(`[CAPTCHA] Waiting for user to solve CAPTCHA for agent ${agentId}...`);
+  
+  // Update agent state to awaiting_captcha
+  await updateAgentState(agentId, 'awaiting_captcha');
+  
+  // Capture initial screenshot and send to database
+  try {
+    const screenshotBuffer = await page.screenshot({ type: 'png', fullPage: false });
+    const screenshotBase64 = screenshotBuffer.toString('base64');
+    const screenshotDataUrl = `data:image/png;base64,${screenshotBase64}`;
+    
+    await callEdgeFunction('worker-update-agent', {
+      workerId: WORKER_ID,
+      agentId,
+      captchaScreenshot: screenshotDataUrl
+    });
+    console.log('[CAPTCHA] Initial screenshot uploaded to database');
+    lastScreenshotTime = Date.now();
+  } catch (error) {
+    console.error('[CAPTCHA] Failed to capture initial screenshot:', error.message);
+  }
+  
+  while (Date.now() - startTime < timeout) {
+    // Check if we've navigated away from CAPTCHA page (user solved it)
+    const url = page.url().toLowerCase();
+    const pageText = await page.textContent('body').catch(() => '');
+    const lowerText = pageText.toLowerCase();
+    
+    // Check if CAPTCHA is gone
+    const captchaIndicators = [
+      'prove you\'re human',
+      'security verification required',
+      'complete the security check',
+      'verify you\'re not a robot'
+    ];
+    
+    let captchaStillPresent = false;
+    for (const indicator of captchaIndicators) {
+      if (lowerText.includes(indicator)) {
+        captchaStillPresent = true;
+        break;
+      }
+    }
+    
+    // Also check for CAPTCHA iframe
+    const captchaIframe = await page.locator('iframe[src*="captcha"], iframe[src*="recaptcha"], iframe[src*="hcaptcha"], iframe[src*="arkose"]').first();
+    if (await captchaIframe.isVisible({ timeout: 1000 }).catch(() => false)) {
+      captchaStillPresent = true;
+    }
+    
+    // If navigated to feed or no captcha indicators, CAPTCHA is solved
+    if (url.includes('/feed') || url.includes('/mynetwork') || url.includes('/in/')) {
+      console.log('[CAPTCHA] Navigated to logged-in page - CAPTCHA solved!');
+      // Clear the screenshot from database
+      await callEdgeFunction('worker-update-agent', {
+        workerId: WORKER_ID,
+        agentId,
+        captchaScreenshot: null
+      });
+      return true;
+    }
+    
+    if (!captchaStillPresent && !url.includes('checkpoint') && !url.includes('challenge')) {
+      console.log('[CAPTCHA] CAPTCHA indicators gone - checking login status...');
+      // Clear the screenshot from database
+      await callEdgeFunction('worker-update-agent', {
+        workerId: WORKER_ID,
+        agentId,
+        captchaScreenshot: null
+      });
+      return true;
+    }
+    
+    // Update screenshot periodically
+    if (Date.now() - lastScreenshotTime > screenshotInterval) {
+      try {
+        const screenshotBuffer = await page.screenshot({ type: 'png', fullPage: false });
+        const screenshotBase64 = screenshotBuffer.toString('base64');
+        const screenshotDataUrl = `data:image/png;base64,${screenshotBase64}`;
+        
+        await callEdgeFunction('worker-update-agent', {
+          workerId: WORKER_ID,
+          agentId,
+          captchaScreenshot: screenshotDataUrl
+        });
+        console.log('[CAPTCHA] Screenshot updated');
+        lastScreenshotTime = Date.now();
+      } catch (error) {
+        console.error('[CAPTCHA] Failed to update screenshot:', error.message);
+      }
+    }
+    
+    console.log(`[CAPTCHA] Still waiting... (${Math.floor((Date.now() - startTime) / 1000)}s elapsed)`);
+    await new Promise(resolve => setTimeout(resolve, pollInterval));
+  }
+  
+  console.log('[CAPTCHA] Timeout waiting for CAPTCHA to be solved');
+  // Clear the screenshot from database on timeout
+  await callEdgeFunction('worker-update-agent', {
+    workerId: WORKER_ID,
+    agentId,
+    captchaScreenshot: null
+  });
+  return false;
+}
+
 async function verifyLogin(page) {
   const url = page.url();
   
@@ -830,10 +943,64 @@ async function handleLinkedInLogin(page, context, action, agentId) {
         throw new Error('Account locked');
         
       case 'captcha':
+        console.log('[LOGIN] CAPTCHA detected, waiting for user to solve...');
+        const captchaSolved = await waitForCaptchaSolved(page, agentId, 300000); // 5 minute timeout
+        
+        if (captchaSolved) {
+          console.log('[LOGIN] CAPTCHA solved! Checking login status...');
+          
+          // Wait a moment for page to settle
+          await humanDelay(2000, 3000);
+          
+          // Check if we're now logged in
+          if (await verifyLogin(page)) {
+            console.log('[LOGIN] CAPTCHA solved - login successful!');
+            return await extractSessionAndComplete(context, agentId);
+          }
+          
+          // Check for any follow-up challenges after CAPTCHA
+          const postCaptchaChallenge = await detectChallengeType(page);
+          console.log(`[LOGIN] Post-CAPTCHA challenge: ${JSON.stringify(postCaptchaChallenge)}`);
+          
+          if (postCaptchaChallenge.type === 'none') {
+            // Try login verification one more time
+            if (await verifyLogin(page)) {
+              return await extractSessionAndComplete(context, agentId);
+            }
+          } else if (postCaptchaChallenge.type === 'email_sms_2fa' || postCaptchaChallenge.type === 'authenticator_2fa') {
+            // Handle 2FA after CAPTCHA
+            console.log('[LOGIN] 2FA required after CAPTCHA');
+            await updateAgentState(agentId, 'awaiting_2fa', {
+              twoFAMethod: postCaptchaChallenge.method || 'unknown'
+            });
+            const postCaptcha2FA = await pollAndEnter2FACode(page, agentId, 300000);
+            if (postCaptcha2FA) {
+              await humanDelay(3000, 5000);
+              if (await verifyLogin(page)) {
+                return await extractSessionAndComplete(context, agentId);
+              }
+            }
+            throw new Error('2FA failed after CAPTCHA');
+          } else if (postCaptchaChallenge.type === 'app_approval') {
+            console.log('[LOGIN] App approval required after CAPTCHA');
+            await updateAgentState(agentId, 'awaiting_app_approval');
+            const appApproved = await waitFor2FACompletion(page, 120000);
+            if (appApproved) {
+              return await extractSessionAndComplete(context, agentId);
+            }
+            throw new Error('App approval timeout after CAPTCHA');
+          }
+          
+          // Unknown state after CAPTCHA
+          await logChallengeDebug(page, agentId, 'post_captcha_unknown');
+          throw new Error('Unknown state after CAPTCHA solved');
+        }
+        
+        // CAPTCHA timeout
         await updateAgentState(agentId, 'failed', {
-          loginError: 'CAPTCHA detected - please try again later'
+          loginError: 'CAPTCHA timeout - please try again'
         });
-        throw new Error('CAPTCHA required');
+        throw new Error('CAPTCHA timeout');
         
       case 'app_approval':
         console.log('[LOGIN] LinkedIn App Approval required');
